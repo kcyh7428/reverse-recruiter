@@ -1,519 +1,326 @@
-# PRD: Clay People Search Browser Automation
+# PRD: Job Seeker Similar-Profile Sourcing Agent (Airtable + Clay + Agent Browser)
 
-**Version:** 1.1  
-**Date:** January 21, 2026  
-**Author:** Reverse Recruiter Technical Team  
-**Status:** Discovery Complete - Ready for Implementation
-
----
-
-## 1. Executive Summary
-
-### Problem Statement
-Career coaches using the Reverse Recruiter system need to discover target profiles (potential networking contacts) for each job seeker. Currently, this requires manual navigation to Clay.com's People Search interface, manually entering filter criteria from the job seeker's Airtable record, importing results, and manually linking profiles to the correct JobSeeker record. This process is time-consuming and error-prone.
-
-### Solution
-Build browser automation using Claude in Chrome to automatically:
-1. Receive JobSeeker targeting criteria + Record ID from n8n workflow
-2. Navigate to Clay's People Search interface
-3. Apply appropriate filters and import profiles
-4. Link imported profiles to the JobSeeker by editing the RecordID column
-5. Trigger the webhook to send profiles back to n8n with correct linkage
-
-### Success Criteria
-- Automation completes a full search-import-link cycle in under 3 minutes
-- Filters applied match JobSeeker criteria with 100% accuracy
-- All imported profiles correctly linked to triggering JobSeeker
-- Profiles flow through existing n8n webhook pipeline with correct RecordID
-- No manual intervention required after triggering
+**Version:** 2.0  
+**Date:** January 28, 2026  
+**Status:** Updated with Cole-style Agent Browser Implementation Details
 
 ---
 
-## 1.1 System Integration Flow
+## 0. Implementation References (for the Agent)
 
-### Trigger Flow
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        n8n WORKFLOW                              │
-├─────────────────────────────────────────────────────────────────┤
-│  1. JobSeeker profile prepared (Stage 0 complete)               │
-│  2. Switch branch triggers HTTP call to Browser Automation      │
-│     Payload includes:                                           │
-│       - JobSeeker Record ID (e.g., rec4klaksdjfio)              │
-│       - TargetIndustries, TargetTitles, Seniority, TargetGeos   │
-│       - ExcludeKeywords                                         │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│               BROWSER AUTOMATION ENDPOINT                        │
-│               (Claude Code / To Be Built)                        │
-├─────────────────────────────────────────────────────────────────┤
-│  Receives: { jobSeekerId, criteria }                            │
-│  Executes: Full automation workflow (see Section 4)             │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│               CLAY TABLE WEBHOOK                                 │
-│               (Triggered by "Create Profile" column)             │
-├─────────────────────────────────────────────────────────────────┤
-│  Fires HTTP POST to n8n webhook endpoint                        │
-│  Payload includes:                                              │
-│    - Profile data (LinkedIn URL, Name, Title, Company, etc.)    │
-│    - JobSeeker RecordID (set by automation)                     │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│               n8n WEBHOOK RECEIVER                               │
-├─────────────────────────────────────────────────────────────────┤
-│  Creates TargetProfile records in Airtable                      │
-│  Links each profile to correct JobSeeker via RecordID           │
-└─────────────────────────────────────────────────────────────────┘
-```
+When implementing this PRD, the agent **must** review and align with these references:
+
+| Reference | Location | Purpose |
+|-----------|----------|---------|
+| Vercel Agent Browser CLI | `https://github.com/vercel-labs/agent-browser` | Install, CLI usage, commands |
+| Cole Medin's Video | `https://www.youtube.com/watch?v=7aEQnTsI6zs` (5:05–10:30) | Workflow + Skill wiring |
+| Local Testing Guide | `execution/local_testing_guide.md` | Docker + Agent Browser + Vertex AI setup |
+| Agent Browser Skill | `skills/agent-browser/SKILL.md` (to be created) | CLI command reference for the agent |
+
+> [!IMPORTANT]
+> The agent should read these files/URLs **before** changing the implementation plan. All browser automation must use `agent-browser` CLI commands, **not** raw Playwright scripts.
 
 ---
 
-## 2. Discovery Findings
+## 1. Goal and Scope
 
-### 2.1 Clay Interface URL
-```
-https://app.clay.com/workspaces/579795/w/find-people?destinationTableId=t_0t6pb5u5rFNYudNfngq&workbookId=wb_0t6pb5rpbgD8nRCHvYh
-```
+Build a **cloud-hosted AI agent** that:
 
-### 2.2 Interface Layout
-- **Left Panel:** Collapsible filter sections (accordions)
-- **Right Panel:** Preview results table with count indicator
-- **Bottom:** "Save search" and "Add to table" action buttons
+1. Reads **job seeker** records from Airtable where status = `profile sourcing`.
+2. Uses **Gemini 2.5** to generate a structured "search profile" from each job seeker's data.
+3. Uses **Vercel Agent Browser CLI** (Cole-style Skill approach) to drive Clay's web UI like a human.
+4. Uses Clay's pre-configured table "send" destinations to deliver profiles to downstream systems.
+5. Clears processed rows from the Clay table after sending.
+6. Updates the job seeker's Airtable record to reflect completion and result status.
 
-### 2.3 Filter Sections Discovered
-
-| Section | Status | Fields Available |
-|---------|--------|------------------|
-| Company attributes | ✅ Mapped | Industries to include/exclude, Company sizes, Description keywords |
-| Job title | ✅ Mapped | Seniority, Job functions, Job title (is similar to), Job titles to exclude |
-| Location | ✅ Mapped | Countries, Regions, Cities, States (include/exclude for each) |
-| Experience | 🔄 Deferred | Years of experience |
-| Profile | 🔄 Deferred | Names, Keywords, Connections |
-| Others | 🔄 Deferred | Certifications, Languages, Education, Companies, etc. |
-
-### 2.4 Element Interaction Patterns
-
-**Accordion Sections:**
-- Collapsed by default
-- Click section header to expand
-- Click again to collapse
-- Element pattern: `find: "{Section Name} section header expand button"`
-
-**Dropdown Fields:**
-- Click to open dropdown menu
-- Type to filter options (autocomplete)
-- Click option to select (appears as pill/tag)
-- Multiple selections supported
-- Click outside to close
-
-**Text Input Fields:**
-- Click input area
-- Type value
-- Press Enter to confirm (creates pill)
-- Repeat for multiple values
+> [!NOTE]
+> No n8n or external orchestrator is involved. The application is self-contained and runs on Google Cloud using Vertex AI Gemini 2.5 and Vercel Agent Browser inside Docker.
 
 ---
 
-## 3. Data Mapping
+## 2. Users and Main Scenario
 
-### 3.1 Airtable Source Schema
+**Primary User:** Recruiter / Operator who:
+- Maintains job seeker data in Airtable.
+- Maintains a Clay workspace/table configured with destinations to send selected rows to a downstream system (CRM, outreach, webhooks, etc.).
 
-**Table:** JobSeekers (tblroM0Stc6twKzdP)  
-**Base:** appWoqZ7azOoISd93
+**Main Scenario:**
 
-| Field Name | Type | Example Values |
-|------------|------|----------------|
-| `TargetIndustries` | Multiline text | "Software Development\nInformation Technology" |
-| `TargetTitles` | Multiline text | "VP Sales\nDirector Business Development\nHead of Sales" |
-| `ExcludeKeywords` | Multiline text | "Retail\nHospitality\nRestaurant" |
-| `TargetGeos` | Multiline text | "San Francisco, CA\nNew York, NY\nLos Angeles, CA" |
-| `Seniority` | Multiline text | "VP\nDirector\nSenior" |
-
-### 3.2 Clay Target Mapping
-
-| Airtable Field | Clay Section | Clay Field | Transform |
-|----------------|--------------|------------|-----------|
-| `TargetIndustries` | Company attributes | Industries to include | Split by newline, trim whitespace |
-| `Seniority` | Job title | Seniority | Map to Clay enum values |
-| `TargetTitles` | Job title | Job title (is similar to) | Split by newline, trim whitespace |
-| `ExcludeKeywords` | Job title | Job titles to exclude | Split by newline, trim whitespace |
-| `TargetGeos` | Location | Cities to include | Split by newline, may need format normalization |
-
-### 3.3 Seniority Value Mapping
-
-| Airtable Input | Clay Dropdown Value |
-|----------------|---------------------|
-| C-Level, C-Suite, Executive, Chief | C-suite |
-| VP, Vice President | VP |
-| Director | Director |
-| Manager | Manager |
-| Senior | Senior |
-| Lead, Principal | Lead/Principal |
-| Mid-Level, Mid Level | Mid-Level |
-| Entry-Level, Junior, Entry Level | Entry-Level |
+1. Recruiter adds or updates a job seeker in Airtable and sets status to `profile sourcing`.
+2. The application wakes up (or is invoked) and processes all job seekers in `profile sourcing` status.
+3. For each job seeker, the application drives the Clay table to find and send similar profiles.
+4. When done, the job seeker record is updated in Airtable with a new status and basic results.
 
 ---
 
-## 4. Technical Architecture
+## 3. System Architecture
 
-### 4.1 Component Overview
+### 3.1 High-Level Overview
 
 ```
-┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│   Airtable      │     │  Claude in       │     │    Clay.com     │
-│   JobSeekers    │────▶│  Chrome Browser  │────▶│  People Search  │
-│   Table         │     │  Automation      │     │  Interface      │
-└─────────────────┘     └──────────────────┘     └─────────────────┘
-                                                          │
-                                                          ▼
-                        ┌──────────────────┐     ┌─────────────────┐
-                        │   n8n Webhook    │◀────│   Clay Table    │
-                        │   Workflow       │     │   (New Rows)    │
-                        └──────────────────┘     └─────────────────┘
-                                │
-                                ▼
+┌─────────────────┐     ┌──────────────────────┐     ┌─────────────────┐
+│   Airtable      │     │  Cloud Run           │     │    Clay.com     │
+│   JobSeekers    │────▶│  Docker Container    │────▶│  People Search  │
+│   Table         │     │  (Python + Agent     │     │  Interface      │
+│                 │◀────│   Browser CLI)       │◀────│                 │
+└─────────────────┘     └──────────────────────┘     └─────────────────┘
+                               │
+                               ▼
                         ┌──────────────────┐
-                        │   Airtable       │
-                        │   TargetProfiles │
+                        │  Vertex AI       │
+                        │  Gemini 2.5      │
                         └──────────────────┘
 ```
 
-### 4.2 Automation Sequence
+### 3.2 Runtime Environment
 
-```
-1. TRIGGER (from n8n)
-   └─▶ JobSeeker profile preparation complete in n8n workflow
-   └─▶ n8n sends HTTP request to browser automation endpoint
-   └─▶ Payload includes: JobSeeker record ID + targeting criteria
+- **Runtime**: Google Cloud Run (or equivalent container hosting).
+- **Container**: Single Docker image containing:
+  - Application code (Python).
+  - Vertex AI Gemini 2.5 client.
+  - **Vercel Agent Browser CLI** installed globally.
+  - System packages required by Playwright/Agent Browser.
 
-2. DATA VALIDATION
-   └─▶ Receive JobSeeker record ID and criteria from n8n
-   └─▶ Parse targeting fields (split multiline, normalize values)
-   └─▶ Store JobSeeker record ID for later linkage step
+### 3.3 Docker Configuration
 
-3. NAVIGATION TO PEOPLE SEARCH
-   └─▶ Open Clay People Search URL in browser tab
-   └─▶ Wait for page load (verify "Add search criteria" visible)
+From `execution/local_testing_guide.md`:
 
-4. FILTER APPLICATION (for each section with data)
-   ├─▶ Company attributes
-   │   └─▶ Expand section
-   │   └─▶ Set "Industries to include" from TargetIndustries
-   │
-   ├─▶ Job title
-   │   └─▶ Expand section
-   │   └─▶ Set "Seniority" dropdown (mapped values)
-   │   └─▶ Set "Job title" input (TargetTitles)
-   │   └─▶ Set "Job titles to exclude" (ExcludeKeywords)
-   │
-   └─▶ Location
-       └─▶ Expand section
-       └─▶ Set "Cities to include" from TargetGeos
+```dockerfile
+# Base image with Playwright browsers pre-installed
+FROM mcr.microsoft.com/playwright/python:v1.49.0-jammy
 
-5. SEARCH VALIDATION
-   └─▶ Check preview count (should be >0 and <100,000)
-   └─▶ Adjust filters if needed
+# Install Agent Browser CLI globally
+RUN npm install -g agent-browser
 
-6. IMPORT PROFILES
-   └─▶ Set "Limit" if needed (default: 100-500)
-   └─▶ Click "Add to table" button
-   └─▶ Wait for import completion notification
-   └─▶ Navigate back to Clay table view
+# CRITICAL: Pin playwright-core to match base image version
+RUN cd "$(npm root -g)/agent-browser" && npm install playwright-core@1.49.0
 
-7. LINK JOBSEEKER ID (Critical Step)
-   └─▶ Verify imported profiles appear in table (check row count)
-   └─▶ Click on "JobSeeker RecordID" column header to edit
-   └─▶ Set static value = JobSeeker record ID from step 1
-   └─▶ Confirm edit applies to all imported rows
-
-8. TRIGGER WEBHOOK
-   └─▶ Click "Create Profile" column header (play button ▷)
-   └─▶ Select "Run all X rows that haven't run or have errors"
-   └─▶ Wait for HTTP calls to complete
-   └─▶ Verify Status Code: 200 for all rows
-
-9. COMPLETION
-   └─▶ Log results: profiles imported, webhook status
-   └─▶ Profiles now flow to n8n with correct JobSeeker linkage
-   └─▶ n8n webhook creates TargetProfile records in Airtable
+# Resource allocation (in docker run)
+# --memory=2g --cpus=2
 ```
 
-### 4.3 n8n Integration Flow
+### 3.4 Agent Browser Skill File (Cole Style)
+
+The agent must be able to locate and read Agent Browser documentation. Create `skills/agent-browser/SKILL.md` with CLI command reference:
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                           n8n WORKFLOW                                   │
-├─────────────────────────────────────────────────────────────────────────┤
-│  JobSeeker Profile Prepared (Stage 0 complete)                          │
-│           │                                                              │
-│           ▼                                                              │
-│  Switch Branch: "trigger-profile-search"                                │
-│           │                                                              │
-│           ▼                                                              │
-│  HTTP Request to Browser Automation Endpoint                            │
-│  Payload: {                                                              │
-│    "jobSeekerId": "rec4klaksdjfio",                                     │
-│    "targetIndustries": ["Software Development", "IT"],                  │
-│    "targetTitles": ["VP Sales", "Director BD"],                         │
-│    "seniority": ["VP", "Director"],                                     │
-│    "targetGeos": ["San Francisco", "New York"],                         │
-│    "excludeKeywords": ["Retail", "Hospitality"]                         │
-│  }                                                                       │
-└─────────────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│              BROWSER AUTOMATION (Claude in Chrome)                       │
-├─────────────────────────────────────────────────────────────────────────┤
-│  1. Receive criteria + JobSeeker ID                                     │
-│  2. Navigate to Clay People Search                                      │
-│  3. Apply filters                                                       │
-│  4. Import profiles to Clay table                                       │
-│  5. Edit "JobSeeker RecordID" column → set to received ID              │
-│  6. Trigger "Create Profile" → run all rows                            │
-└─────────────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                    CLAY TABLE WEBHOOK                                    │
-├─────────────────────────────────────────────────────────────────────────┤
-│  "Create Profile" HTTP column fires for each row                        │
-│  Payload includes: profile data + JobSeeker RecordID                    │
-│  Endpoint: n8n webhook (action: create-targetprofile)                   │
-└─────────────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────────────┐
-│                    n8n WEBHOOK RECEIVER                                  │
-├─────────────────────────────────────────────────────────────────────────┤
-│  Receives profiles with correct JobSeeker linkage                       │
-│  Creates TargetProfile records in Airtable                              │
-│  Links each profile to the originating JobSeeker                        │
-└─────────────────────────────────────────────────────────────────────────┘
+skills/
+└── agent-browser/
+    └── SKILL.md    # Contains CLI usage from GitHub repo --help
 ```
 
-### 4.4 MCP Tools Required
+Add to your project or global `AGENTS.md`:
 
-| Tool | Purpose |
-|------|---------|
-| `Claude in Chrome:navigate` | Open Clay People Search URL, return to table view |
-| `Claude in Chrome:find` | Locate filter elements, column headers, buttons |
-| `Claude in Chrome:computer` (click) | Expand sections, select options, trigger actions |
-| `Claude in Chrome:computer` (type) | Enter filter values, set JobSeeker ID |
-| `Claude in Chrome:computer` (screenshot) | Verify state, debug issues |
-| `Claude in Chrome:read_page` | Inspect DOM structure, verify row counts |
-| `Claude in Chrome:form_input` | Set column static values |
+```markdown
+## Browser Automation
+Use `agent-browser` for web automation. Run `agent-browser --help` for all commands.
 
-### 4.5 Clay Table Operations (Post-Import)
-
-**Editing JobSeeker RecordID Column:**
-1. Click column header "JobSeeker RecordID"
-2. Edit panel appears on right side
-3. Enter static value (the JobSeeker record ID)
-4. Value applies to all rows in the table
-
-**Triggering Create Profile Column:**
-1. Click column header "Create Profile" (has play button ▷)
-2. Dropdown appears with options:
-   - "Run first 10 rows"
-   - "Run all X rows that haven't run or have errors"
-3. Select "Run all X rows..." option
-4. Wait for completion (Status Code: 200 for each row)
+Core workflow:
+1. `agent-browser open <url>` - Navigate to page
+2. `agent-browser snapshot -i` - Get interactive elements with refs (@e1, @e2)
+3. `agent-browser click @e1` / `fill @e2 "text"` - Interact using refs
+4. Re-snapshot after page changes
+```
 
 ---
 
-## 5. Implementation Plan
+## 4. Functional Requirements
 
-### Phase 1: People Search Filter Application (MVP)
-**Goal:** Demonstrate filter application and profile import
+### 4.1 Job Seeker Discovery (Airtable)
 
-1. Navigate to Clay People Search URL
-2. Expand Location section
-3. Add cities to "Cities to include"
-4. Verify preview shows filtered results
-5. Click "Add to table"
-6. Confirm profiles appear in Clay table
+| ID | Requirement |
+|----|-------------|
+| FR-1 | Query Airtable for records where `status` = `profile sourcing`. |
+| FR-2 | Read at least: Record ID, Name, Role/Title, Skills/keywords, Location preference, Notes/description. |
+| FR-3 | Field names must be configurable via environment variables or config file. |
 
-**Success Criteria:** Successful import with one filter type
+### 4.2 Candidate Understanding (Gemini 2.5)
 
-### Phase 2: All Core Filters
-**Goal:** Implement all mapped filter types
+| ID | Requirement |
+|----|-------------|
+| FR-4 | For each job seeker, call Gemini 2.5 to generate a **structured search profile** JSON containing: target role titles, seniority range, locations/regions, primary skills/keywords, excluded roles/industries. |
+| FR-5 | The Gemini prompt must output **strict JSON** for easy parsing (no free-form prose). |
 
-1. Add Company attributes → Industries
-2. Add Job title → Seniority, Titles, Exclusions
-3. Add Location → Cities
-4. Handle empty fields gracefully (skip if no data)
-5. Add filter clearing logic (reset before new search)
+**Example Search Profile JSON:**
+```json
+{
+  "targetTitles": ["Senior Backend Engineer", "Staff Engineer"],
+  "seniority": ["Senior", "Lead/Principal"],
+  "locations": ["San Francisco, CA", "New York, NY"],
+  "skills": ["Python", "Distributed Systems"],
+  "excludeKeywords": ["Retail", "Hospitality"]
+}
+```
 
-**Success Criteria:** Full filter application for complete criteria set
+### 4.3 Clay Table Interaction (via Vercel Agent Browser CLI)
 
-### Phase 3: JobSeeker ID Linkage
-**Goal:** Automate the JobSeeker record ID association
+> [!IMPORTANT]
+> All browser automation must use `agent-browser` CLI commands. Do **NOT** write raw Playwright scripts.
+> The agent should adopt a **Snapshot-First** mindset: always re-snapshot after any interaction that *might* change the page state.
 
-1. After import, navigate back to Clay table view
-2. Locate and click "JobSeeker RecordID" column header
-3. Enter the JobSeeker record ID in the edit panel
-4. Verify ID applies to all imported rows
+| ID | Requirement |
+|----|-------------|
+| FR-6 | Use Agent Browser CLI to log in to `https://app.clay.com` and navigate to the configured Clay table. |
+| FR-6a | **Stealth Mode**: Always use stealth flags (`--disable-blink-features=AutomationControlled`) and realistic User-Agents to bypass Clay's bot detection. |
+| FR-7 | Use `agent-browser fill` and related commands to populate search/filter UI with the Gemini-derived search profile. |
+| FR-8 | Select rows representing suitable profiles and activate Clay's **"send" / destination** functionality via the UI. |
+| FR-9 | Use `snapshot -i` and/or additional reads to verify send completion (UI confirmation or status column update). |
+| FR-10 | After successful send, **clear/delete** processed rows from the Clay table using Agent Browser commands. |
 
-**Success Criteria:** All imported rows have correct JobSeeker ID
+**Agent Browser Workflow (Cole Style):**
 
-### Phase 4: Webhook Trigger Automation
-**Goal:** Automate the "Create Profile" trigger
+```bash
+# 1. Open and authenticate with Stealth flags
+agent-browser open "https://app.clay.com/workspaces/..." --stealth
+agent-browser snapshot -i --json  # Get element refs
 
-1. Locate and click "Create Profile" column header
-2. Select "Run all X rows that haven't run or have errors"
-3. Wait for HTTP calls to complete
-4. Verify Status Code: 200 for all rows
+# 2. Apply filters (example)
+# IMPORTANT: Use the refs (@eX) from the snapshot, not CSS selectors
+agent-browser click @e5            # Expand filter section
+agent-browser fill @e12 "Senior Backend Engineer"
+agent-browser press Enter
 
-**Success Criteria:** All profiles sent via webhook with JobSeeker ID
+# 3. Import/send profiles
+# Re-snapshot if needed to find the new "Add" button ref
+agent-browser snapshot -i --json 
+agent-browser click @e25           # "Add to table" button
+agent-browser snapshot -i --json   # Verify completion
 
-### Phase 5: n8n Integration
-**Goal:** Complete end-to-end pipeline from n8n trigger
+# 4. Clear processed rows
+agent-browser click @e30           # Select all
+agent-browser click @e35           # Delete button
+```
 
-1. Create n8n switch branch for "trigger-profile-search"
-2. Build HTTP node to call browser automation endpoint
-3. Pass JobSeeker ID + criteria in payload
-4. Verify webhook receiver creates TargetProfile records
-5. Confirm JobSeeker linkage in Airtable
+### 4.4 Airtable Updates
 
-**Success Criteria:** Zero manual intervention for complete cycle
+| ID | Requirement |
+|----|-------------|
+| FR-11 | After Clay step finishes, update job seeker record with: new status (`sourced`, `no_matches_found`, or `error`), number of profiles sent, timestamp. |
+| FR-12 | On error, write error status and short description into Airtable. |
 
-### Phase 6: Error Handling & Robustness
-**Goal:** Production-ready reliability
+### 4.5 Execution Control
 
-1. Add retry logic for flaky element interactions
-2. Handle "no results" scenario
-3. Handle "too many results" scenario
-4. Verify import success before proceeding to ID linkage
-5. Handle webhook failures (retry logic)
-6. Screenshot on failure for debugging
-7. Logging for audit trail
-
-**Success Criteria:** Automation recovers gracefully from common failures
-
----
-
-## 6. Known Limitations & Risks
-
-### Technical Risks
-
-| Risk | Mitigation |
-|------|------------|
-| Clay UI changes break selectors | Use semantic find queries, not hardcoded refs |
-| Autocomplete timing issues | Add explicit waits after typing |
-| Rate limiting from Clay | Add delays between operations |
-| Session timeout during long operations | Check session validity before starting |
-| Webhook failures | Verify Status Code: 200 before proceeding |
-| Column edit doesn't propagate | Verify all rows show updated RecordID |
-
-### Data Quality Risks
-
-| Risk | Mitigation |
-|------|------------|
-| Airtable field format variations | Normalize input data (trim, split, map) |
-| City names not matching Clay's format | May need location normalization logic |
-| Seniority values not in mapping table | Add fallback handling, log unmapped values |
-| Duplicate profiles across searches | Clay table may need deduplication logic |
-
-### Scope Limitations (Phase 1)
-
-- No support for: Experience, Profile keywords, Education, Companies filters
-- No "Save search" functionality (just "Add to table")
-- No incremental/delta imports (full search each time)
-- Requires active Clay session (no automated login)
-- One JobSeeker processed at a time (sequential, not parallel)
+| ID | Requirement |
+|----|-------------|
+| FR-13 | Support a **batch size** limit (max N job seekers per run). |
+| FR-14 | Support two modes: **Manual** (run once on command) and **Scheduled** (invoked by Cloud Scheduler). |
 
 ---
 
-## 7. Testing Strategy
+## 5. Non-Functional Requirements
 
-### Manual Testing Checklist
-
-**People Search Interface:**
-- [ ] Navigate to People Search URL loads correctly
-- [ ] Each filter section expands on click
-- [ ] Industries dropdown accepts typed values
-- [ ] Seniority dropdown allows multiple selections
-- [ ] Job title input creates pills for each value
-- [ ] Cities input finds and selects locations
-- [ ] Preview count updates after filter changes
-- [ ] "Add to table" button triggers import
-- [ ] Profiles appear in Clay table after import
-
-**Clay Table Operations:**
-- [ ] Navigate to Target Profile Sourcing table
-- [ ] Click "JobSeeker RecordID" column header opens edit panel
-- [ ] Static value input accepts record ID format (recXXXXXXXXX)
-- [ ] Updated value appears in all imported rows
-- [ ] Click "Create Profile" column header shows dropdown
-- [ ] "Run all X rows" option triggers webhook for all rows
-- [ ] Wait for Status Code: 200 on all rows
-
-**End-to-End:**
-- [ ] n8n webhook receives profiles with correct JobSeeker RecordID
-- [ ] TargetProfile records created in Airtable
-- [ ] TargetProfiles correctly linked to JobSeeker record
-
-### Automated Validation
-
-- [ ] Screenshot before and after filter application
-- [ ] Compare expected vs actual filter pills
-- [ ] Verify preview count is within acceptable range
-- [ ] Confirm import completion indicator
-- [ ] Verify JobSeeker RecordID column shows expected value
-- [ ] Count rows with Status Code: 200 matches import count
+| ID | Requirement |
+|----|-------------|
+| NFR-1 | Must run inside a single Docker container on Google Cloud. |
+| NFR-2 | All secrets (Airtable API keys, Clay credentials, Vertex AI keys) must be in environment variables or secrets manager. |
+| NFR-3 | Basic logging: start/end of each run, per-job-seeker success/failure and key metrics. |
+| NFR-4 | Per job seeker timeout (5-10 minutes); on timeout, mark as error and proceed. |
 
 ---
 
-## 8. Future Enhancements
+## 6. Assumptions and Constraints
 
-### Short Term
-- Support additional filter sections (Experience, Education)
-- Add "Save search" for reusable filter templates
-- Implement incremental imports (exclude already-imported profiles)
-
-### Medium Term
-- Batch processing for multiple JobSeekers
-- Scheduling via n8n trigger
-- Result quality scoring and feedback loop
-
-### Long Term
-- Direct CrustData PersonDB API integration (bypass Clay UI)
-- Custom Clay table with automation-specific columns
-- A/B testing of filter strategies per JobSeeker
+- Clay table is already configured by the user with desired columns, enrichment settings, and a destination.
+- Browser automation uses Vercel Agent Browser CLI (**not** direct Playwright API).
+- Airtable access is via MCP server if available; otherwise via Airtable API.
+- The agent is allowed to be non-deterministic in how it searches/selects profiles, as long as it respects prompts and avoids irrelevant results.
 
 ---
 
-## 9. Appendix
+## 7. Example Flow (One Job Seeker)
 
-### A. Clay People Search Interface Screenshots
+```mermaid
+sequenceDiagram
+    participant App
+    participant Airtable
+    participant Gemini
+    participant AgentBrowser
+    participant Clay
 
-(Screenshots captured during discovery session - January 21, 2026)
+    App->>Airtable: Query status = "profile sourcing"
+    Airtable-->>App: Job seeker record
+    App->>Gemini: Generate search profile JSON
+    Gemini-->>App: {targetTitles, locations, ...}
+    App->>AgentBrowser: open clay.com
+    AgentBrowser->>Clay: Navigate to table
+    App->>AgentBrowser: snapshot -i --json
+    AgentBrowser-->>App: Element refs (@e1, @e2, ...)
+    App->>AgentBrowser: fill @e5 "Senior Engineer"
+    AgentBrowser->>Clay: Apply filter
+    App->>AgentBrowser: click @e20 (Send button)
+    AgentBrowser->>Clay: Trigger send to destination
+    App->>AgentBrowser: snapshot (verify completion)
+    App->>AgentBrowser: click @e30 (Delete rows)
+    AgentBrowser->>Clay: Clear processed rows
+    App->>Airtable: Update status = "sourced", profiles_sent = X
+```
 
-1. Full interface with filter panel and preview
-2. Company attributes section expanded
-3. Job title section expanded
-4. Location section expanded
+---
 
-### B. Element Reference IDs (from discovery)
+## 8. Implementation Notes for the AI Agent
 
-These are session-specific and will change, but patterns are consistent:
-- Company attributes header: ~ref_1308
-- Job title header: ~ref_1310
-- Experience header: ~ref_1312
-- Location header: ~ref_1314
-- Save search button: ~ref_1333
-- Add to table button: ~ref_1335
+### 8.1 Required Reading Order
 
-### C. Related Documentation
+1. **Read local docs first:**
+   - `UpdatedPRD.md` (this file)
+   - `execution/local_testing_guide.md` (Docker, Vertex AI auth, Agent Browser install)
+   - `skills/agent-browser/SKILL.md` (CLI command reference)
 
-- Airtable JobSeekers Schema: See project file `reverse_recruiter_technical_blueprint_v2.md`
-- n8n Workflow: ID `DFwKUCHIw3SAVjDF`
-- Webhook endpoint: `https://n8n.talentsignals.ai/webhook/reverse-recruiter`
+2. **Read Agent Browser documentation:**
+   - Visit `https://github.com/vercel-labs/agent-browser`
+   - Review: Installation, CLI usage, Agent Mode workflow
+
+### 8.2 Implementation Phases
+
+| Phase | Focus |
+|-------|-------|
+| Phase 1 | Airtable MCP/API integration (query and update job seeker records) |
+| Phase 2 | Gemini 2.5 integration and search-profile JSON design |
+| Phase 3 | Agent Browser integration (ensure CLI works inside Docker as shown in `local_testing_guide.md`) |
+| Phase 4 | Clay UI automation via Agent Browser commands (FR-6 through FR-10) |
+| Phase 5 | End-to-end loop: Airtable → Gemini → Clay → destination → Airtable |
+
+### 8.3 Key Principles (Cole's Approach)
+
+> [!CAUTION]
+> Do **NOT** introduce new Playwright scripts that import `playwright.async_api` unless strictly necessary for debugging.
+
+**Preferred approach:** "Teach the agent to use `agent-browser` CLI via Skill" (Cole's method) over "write and maintain manual Playwright code."
+
+**Core Agent Browser Workflow:**
+```bash
+# Observe
+agent-browser snapshot -i --json  # Returns refs like @e1, @e2
+
+# Decide (LLM parses snapshot, identifies target refs)
+
+# Act
+agent-browser click @e5
+agent-browser fill @e12 "search term"
+
+# Re-observe
+agent-browser snapshot -i --json
+```
+
+---
+
+## 9. File Structure Reference
+
+```
+Reverse Recruiter/
+├── execution/
+│   ├── main.py                    # Flask entry point
+│   ├── agent_orchestrator.py      # Agent loop logic
+│   ├── airtable_client.py         # Airtable API client
+│   ├── local_testing_guide.md     # Docker & local setup
+│   ├── Dockerfile                 # Container definition
+│   └── session_cookies.json       # Clay session cookies
+├── skills/
+│   └── agent-browser/
+│       └── SKILL.md               # Agent Browser CLI reference
+├── directives/
+│   └── clay_people_search.md      # Search directive template
+├── AGENTS.md                      # Agent instructions
+├── UpdatedPRD.md                  # This file
+└── PRD.md                         # Original PRD (reference)
+```

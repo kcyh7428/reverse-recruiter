@@ -101,7 +101,8 @@ To set industries:
    - Type the industry name in the search box
    - Wait for dropdown options to filter
    - Click the matching option to add as pill
-5. Click outside dropdown to close
+5. **CRITICAL:** Press `ESC` to close the dropdown before moving to the next section
+   - Clay dropdowns stay open after selection; pressing ESC ensures clean state
 
 ### Stage 4: Apply Job Title Filters
 
@@ -111,17 +112,20 @@ To set seniority, titles, and exclusions:
 2. **Seniority dropdown:**
    - Click "Seniority" dropdown
    - Select matching values from: C-suite, Manager, Director, VP, Senior, Lead/Principal, Mid-Level, Entry-Level
+   - **Press `ESC` to close the dropdown**
 3. **Job title "is similar to":**
    - Verify mode dropdown shows "is similar to"
    - Click the job title input field
    - For each title from `TargetTitles`:
      - Type the title
      - Press Enter or click suggestion to add as pill
+   - **Press `ESC` to close the input before moving on**
 4. **Job titles to exclude:**
    - Click "Job titles to exclude" input
    - For each keyword from `ExcludeKeywords`:
      - Type the keyword
      - Press Enter to add as pill
+   - **Press `ESC` to close the input**
 
 ### Stage 5: Apply Location Filters
 
@@ -134,7 +138,8 @@ To set target cities:
    - Type the city name
    - Wait for autocomplete suggestions
    - Click the matching city option
-5. Click outside to close dropdown
+5. **CRITICAL:** Press `ESC` to close the dropdown before proceeding
+   - Do NOT rely on "click outside" — always use ESC for consistent behavior
 
 ### Stage 6: Verify and Execute Search
 
@@ -171,6 +176,7 @@ After clicking a dropdown:
 - Click option or press Enter to select
 - Pill appears showing selection
 - Repeat for multiple values
+- **ALWAYS press `ESC` after finishing selections** to close the dropdown before interacting with other elements
 
 ## Error Handling
 
@@ -192,15 +198,15 @@ If a filter element cannot be located:
 - Scroll within the filter panel
 - Check if field name has changed
 
-## Integration with n8n Workflow
+## Integration with Airtable
 
 After profiles are imported to Clay:
 1. Clay table processes new rows through configured enrichment
-2. Webhook triggers n8n workflow (DFwKUCHIw3SAVjDF)
-3. Profiles flow to Airtable TargetProfiles table with JobSeeker linkage
+2. Profiles are sent via Clay's pre-configured destinations
+3. The agent uses **Airtable MCP** to poll for JobSeeker records and update status
 
-Webhook endpoint: `https://n8n.talentsignals.ai/webhook/reverse-recruiter`
-Action parameter: `create-targetprofile`
+> [!NOTE]
+> The agent polls Airtable for records matching trigger conditions (e.g., JobSeeker status = "✨ Sourcing Profiles") rather than relying on external webhooks.
 
 ## Seniority Value Mapping
 

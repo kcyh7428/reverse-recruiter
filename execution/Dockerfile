@@ -1,5 +1,6 @@
-# Use a full Python runtime to ensure all build tools are present
-FROM python:3.11
+# Use official Playwright Python image (includes Python 3.11, Node.js, and Browsers)
+# This avoids the large browser download during build which was failing
+FROM mcr.microsoft.com/playwright/python:v1.49.0-jammy
 
 # Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1
@@ -7,23 +8,24 @@ ENV PYTHONUNBUFFERED=1
 ENV PORT=8080
 
 # Install system dependencies
-# We need Node.js for Vercel Agent Browser, and Chromium for the browser engine
-RUN apt-get update && apt-get install -y \
+# Node.js is NOT present in the python image by default, so we must install it.
+# agent-browser is a node package.
+# Added --fix-missing to handle potential repo network timeouts
+RUN apt-get update --fix-missing && apt-get install -y \
     curl \
     gnupg \
-    unzip \
     xvfb \
-    chromium \
-    chromium-driver \
-    git \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y nodejs \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Vercel Agent Browser CLI
-# Installing globally to make 'agent-browser' command available
-RUN npm install -g agent-browser
+# Install Vercel Agent Browser CLI and pin Playwright version
+# We install agent-browser, then force-downgrade its internal playwright-core dependency
+# to 1.49.0 to match the browser binaries pre-installed in this Docker image.
+RUN npm install -g agent-browser \
+    && cd "$(npm root -g)/agent-browser" \
+    && npm install playwright-core@1.49.0
 
 # Set work directory
 WORKDIR /app
@@ -39,5 +41,5 @@ COPY . .
 EXPOSE 8080
 
 # Use Gunicorn as the production server
-# 1 worker, 8 threads to handle concurrent requests (Cloud Run scales containers)
+# 1 worker, 8 threads to handle concurrent requests
 CMD exec gunicorn --bind :$PORT --workers 1 --threads 8 --timeout 0 main:app

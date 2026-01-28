@@ -47,7 +47,33 @@ Errors are learning opportunities. When something breaks:
 4. Update directive to include new flow
 5. System is now stronger
 
+## Special Execution: Clay Authentication
+
+Clay.com has strict bot detection and session management. To maintain reliability:
+
+1. **Stealth Mode Layer**: Always use the stealth arguments (`--disable-blink-features=AutomationControlled`) and a realistic User-Agent to keep `navigator.webdriver` false.
+2. **Auto-Login Fallback**: Cookie injection is fragile. Always implement an "Auto-Login" flow in scripts that detects expired sessions and uses `.env` credentials to log in.
+3. **Dynamic Snapshot Parsing**: Do not hardcode element IDs if possible. scripts should parse the real-time snapshot to find `@ref` IDs, making the automation resilient to Clay's layout updates.
+
+## Skills (Browser Automation)
+
+For complex, multi-step browser automation (like Clay interactions), use **Skills** instead of writing inline code.
+
+**Skills location:** `.agent/skills/`
+
+| Skill | Purpose |
+|-------|---------|
+| `agent-browser` | CLI reference for web automation |
+| `clay-people-search` | Automate Clay's "Find People" search interface |
+| `clay-profile-review-link` | Review imported profiles and link to JobSeeker |
+| `clay-bulk-delete` | Clear all rows from Clay table |
+
+**When to use Skills vs Directives:**
+- **Skills**: Complex browser automation with many steps, element refs, error handling
+- **Directives**: Simple SOPs for manual processes, API integrations, data processing
+
 ## File Organization
+...
 
 **Deliverables vs Intermediates:**
 - **Deliverables**: Google Sheets, Google Slides, or other cloud-based outputs that the user can access

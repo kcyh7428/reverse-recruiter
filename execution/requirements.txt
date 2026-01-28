@@ -5,3 +5,6 @@ pyairtable>=2.2.0
 python-dotenv>=1.0.0
 # Pydantic is often pulled in by other libs, but explicit is better
 pydantic>=2.0.0
+requests>=2.31.0
+certifi>=2024.0.0
+urllib3>=2.0.0

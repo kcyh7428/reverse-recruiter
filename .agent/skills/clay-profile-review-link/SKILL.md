@@ -243,7 +243,7 @@ If results are borderline (e.g., 50% good, 50% bad):
 ### Typical Agent Flow
 
 ```
-Agent receives: JobSeeker profile ready for target discovery
+Agent polls: Airtable MCP for JobSeeker records where status = "profile sourcing"
 
 1. Agent uses: clay-people-search skill
    → Applies filters, imports profiles
@@ -255,9 +255,9 @@ Agent receives: JobSeeker profile ready for target discovery
    
    IF PASS:
      → Links to JobSeeker
-     → Triggers webhook
+     → Triggers Clay's pre-configured destinations
      → Returns: SUCCESS
-     → Agent reports completion
+     → Agent updates JobSeeker status via Airtable MCP
    
    IF FAIL:
      → Returns: RETRY with recommendations

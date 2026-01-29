@@ -18,17 +18,22 @@ This document outlines the current progress, completed milestones, and the remai
 
 ---
 
-## 🚀 Phase 2: Production Validation (CURRENT - PRIORITY)
+## 🚀 Phase 2: Production Validation (COMPLETED ✅)
 **Goal:** Deploy the **existing Docker image** to Cloud Run and validate that authentication works from Google's infrastructure.
 
-This phase validates the unknowns before we invest more time in local-only development.
+This phase validated that the agent can bypass bot detection and maintain session persistence (or self-heal login) from GCP.
 
 ### Checklist
-- [ ] **Secret Manager Setup**: Migrate `CLAY_EMAIL`, `CLAY_PASSWORD`, `AIRTABLE_API_KEY` to GCP Secret Manager.
-- [ ] **Cloud Run Deployment**: Deploy the current `execution/` Docker image to Cloud Run.
-- [ ] **Endpoint Test**: Hit `/test-clay-auth` from an external client (e.g., `curl`) and verify `logged_in: true`.
-- [ ] **IP/Bot Detection Check**: Confirm Stealth Mode still works from GCP's IP ranges.
-- [ ] **Resource Tuning**: If Chrome crashes, increase memory (4GB+) and `--shm-size` equivalent.
+- [x] **Secret Manager Setup**: Migrated `CLAY_EMAIL`, `CLAY_PASSWORD`, `AIRTABLE_API_KEY` to GCP Secret Manager.
+- [x] **Cloud Run Deployment**: Deployed the current `execution/` Docker image to Cloud Run.
+- [x] **Endpoint Test**: Hit `/test-clay-auth` and verified `logged_in: true`.
+- [x] **IP/Bot Detection Check**: Confirmed Stealth Mode still works from GCP's IP ranges (`webdriver: false`).
+- [x] **Resource Tuning**: Increased memory to 4GB and 2 vCPU for stable rendering.
+
+### Lessons Learned
+- **Auth Self-Healing**: Automated login handles expired cookies reliably.
+- **Domain Restrictions**: Public access (`allUsers`) is restricted; verification requires ID tokens.
+- **Memory**: 4GB RAM is the minimum safe threshold for complex Playwright snapshots on Cloud Run.
 
 ### Known Risks
 | Risk | Mitigation |

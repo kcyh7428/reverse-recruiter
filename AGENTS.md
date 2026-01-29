@@ -88,10 +88,114 @@ For complex, multi-step browser automation (like Clay interactions), use **Skill
 
 **Key principle:** Local files are only for processing. Deliverables live in cloud services (Google Sheets, Slides, etc.) where the user can access them. Everything in `.tmp/` can be deleted and regenerated.
 
+---
+
+## Cloud Deployment Procedures (GCP)
+
+> [!IMPORTANT]
+> **NEVER DEVIATE from these procedures without explicit user approval.** A new agent picking up this project should follow these steps exactly.
+
+### 1. Cloud Build & Cloud Run Workflow
+
+The `execution/` directory is the Docker build context. All builds and deployments use these exact commands:
+
+```bash
+# Step 1: Build Docker image via Cloud Build (Global by default is OK)
+cd execution
+gcloud builds submit --tag us-central1-docker.pkg.dev/reverse-recruiter-prod/clay-automation/clay-browser-automation .
+
+# Step 2: Deploy to Cloud Run
+gcloud run deploy clay-browser-automation \
+    --image us-central1-docker.pkg.dev/reverse-recruiter-prod/clay-automation/clay-browser-automation:latest \
+    --region us-central1
+```
+
+**Key Infrastructure:**
+| Component | Value |
+|-----------|-------|
+| GCP Project | `reverse-recruiter-prod` |
+| Artifact Registry | `us-central1-docker.pkg.dev/reverse-recruiter-prod/clay-automation` |
+| Cloud Run Service | `clay-browser-automation` |
+| Region | `us-central1` |
+| Memory | `4Gi` |
+| CPU | `2` vCPU |
+| Auth | `--no-allow-unauthenticated` (requires ID token) |
+
+### 2. Critical: Deterministic Login Pattern
+
+> [!CAUTION]
+> **The AI-driven login loop is UNRELIABLE.** It can enter infinite loops due to insufficient wait times for the heavy React app.
+
+**THE WORKING PATTERN (always use this):**
+
+```python
+def perform_login() -> bool:
+    """6-step deterministic login with explicit, generous waits."""
+    # Step 1: Navigate to login page
+    run_agent_browser_command(["open", "https://app.clay.com/login"])
+    time.sleep(15)  # CRITICAL: 15s for initial page load
+
+    # Step 2: Parse snapshot, find email ref, fill email
+    snapshot = run_agent_browser_command(["snapshot"])
+    email_ref = parse_ref(snapshot, "email")  # e.g., returns "e3"
+    run_agent_browser_command(["fill", f"@{email_ref}", email])
+    
+    # Step 3: Click "Continue" explicitly (don't rely on Enter)
+    cont_ref = parse_ref(snapshot, "Continue")
+    run_agent_browser_command(["click", f"@{cont_ref}"])
+    time.sleep(10)  # CRITICAL: Wait for password field to appear
+    
+    # Step 4: Fill password, click Continue
+    pass_snapshot = run_agent_browser_command(["snapshot"])
+    pass_ref = parse_ref(pass_snapshot, "password")
+    run_agent_browser_command(["fill", f"@{pass_ref}", password])
+    cont_ref_2 = parse_ref(pass_snapshot, "Continue")
+    run_agent_browser_command(["click", f"@{cont_ref_2}"])
+    
+    # Step 5: Wait for heavy redirect/security check
+    time.sleep(25)  # CRITICAL: Clay has heavy post-login processing
+    
+    # Step 6: Verify success
+    # ... (check URL, snapshot for absence of "login")
+```
+
+**Why these wait times?**
+- `15s` after opening login page: Clay's React bundle is large
+- `10s` after email submit: Password field animates in
+- `25s` after password submit: Heavy redirect, potential security checks
+
+### 3. Testing Endpoints
+
+```bash
+# Get auth token for Cloud Run
+TOKEN=$(gcloud auth print-identity-token)
+
+# Health check (should return build_version if set)
+curl -H "Authorization: Bearer $TOKEN" https://clay-browser-automation-702709903794.us-central1.run.app/
+
+# Test authentication flow
+curl -H "Authorization: Bearer $TOKEN" https://clay-browser-automation-702709903794.us-central1.run.app/test-clay-auth
+
+# Trigger full automation for a JobSeeker
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+    -d '{"jobseeker_id": "recXXX"}' \
+    https://clay-browser-automation-702709903794.us-central1.run.app/run-automation
+```
+
+### 4. Common Pitfalls & Self-Annealing Lessons
+
+| Problem | Root Cause | Fix |
+|---------|-----------|-----|
+| Infinite "Enter" loop during login | AI waits only 1-2s, page not ready | Use deterministic `perform_login()` with 15/10/25s waits |
+| Logs show old code after deploy | Image caching or wrong context | Always run from `execution/` dir, check rev name |
+| "Welcome back" persists after login | Password field not found due to short wait | Increase wait to 10s after email submission |
+| Cloud Build uses "global" | This is fine. Cloud Build location doesn't affect Cloud Run region. |
+
+---
+
 ## Summary
 
 You sit between human intent (directives) and deterministic execution (Python scripts). Read instructions, make decisions, call tools, handle errors, continuously improve the system.
 
 Be pragmatic. Be reliable. Self-anneal.
-
 

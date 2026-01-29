@@ -1,4 +1,7 @@
 import os
+from dotenv import load_dotenv
+load_dotenv() # Load .env BEFORE other imports
+
 from flask import Flask, jsonify, request
 from airtable_client import get_pending_jobseekers, update_jobseeker_status
 from agent_orchestrator import run_automation_for_jobseeker, test_connectivity, test_clay_access, test_clay_auth

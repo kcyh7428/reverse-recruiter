@@ -34,11 +34,14 @@ def get_pending_jobseekers() -> List[Dict]:
             fields = r.get("fields", {})
             jobseekers.append({
                 "id": r["id"],  # Internal Airtable Record ID
+                "name": fields.get("Name", "Unknown"),
                 "targetTitles": fields.get("TargetTitles", ""),
                 "targetGeos": fields.get("TargetGeos", ""),
                 "seniority": fields.get("Seniority", ""),
                 "excludeKeywords": fields.get("ExcludeKeywords", ""),
-                "targetIndustries": fields.get("TargetIndustries", "")
+                "targetIndustries": fields.get("TargetIndustries", ""),
+                "includeKeywords": fields.get("IncludeKeywords", ""),
+                "notesForCoach": fields.get("NotesForCoach", "")
             })
         
         logger.info(f"Found {len(jobseekers)} pending job seekers.")

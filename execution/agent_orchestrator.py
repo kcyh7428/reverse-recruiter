@@ -4,6 +4,8 @@ import json
 import logging
 import time
 from typing import Dict, Any
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from google.api_core.exceptions import ResourceExhausted
 
 # Vertex AI imports
 import vertexai
@@ -16,7 +18,15 @@ logger = logging.getLogger(__name__)
 # Constants
 PROJECT_ID = os.getenv("GCP_PROJECT_ID")
 REGION = os.getenv("GCP_REGION", "us-central1")
-MAX_TURNS = 15  # Limit safety against infinite loops
+MAX_TURNS = 30  # Increased limit for complex filter flows
+
+@retry(
+    retry=retry_if_exception_type(ResourceExhausted),
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=2, min=5, max=60)
+)
+def call_with_retry(func, *args, **kwargs):
+    return func(*args, **kwargs)
 
 try:
     vertexai.init(project=PROJECT_ID, location=REGION)
@@ -37,11 +47,27 @@ def load_directive(file_path: str, context: Dict[str, Any]) -> str:
         with open(file_path, "r") as f:
             template = f.read()
         
-        # Simple substitution
+        # Original field substitutions
         text = template.replace("{{targetTitles}}", str(context.get("targetTitles", "")))
         text = text.replace("{{targetGeos}}", str(context.get("targetGeos", "")))
         text = text.replace("{{seniority}}", str(context.get("seniority", "")))
         text = text.replace("{{excludeKeywords}}", str(context.get("excludeKeywords", "")))
+        
+        # AI-interpreted criteria substitutions (Phase 3)
+        text = text.replace("{{ai_titles}}", json.dumps(context.get("ai_titles", [])))
+        text = text.replace("{{ai_locations}}", json.dumps(context.get("ai_locations", [])))
+        text = text.replace("{{ai_seniority}}", json.dumps(context.get("ai_seniority", [])))
+        text = text.replace("{{ai_industries}}", json.dumps(context.get("ai_industries", [])))
+        text = text.replace("{{ai_excludeKeywords}}", json.dumps(context.get("ai_excludeKeywords", [])))
+        text = text.replace("{{ai_confidence}}", str(context.get("ai_confidence", "unknown")))
+        text = text.replace("{{ai_reasoning}}", str(context.get("ai_reasoning", "")))
+        
+        text = text.replace("{{ai_reasoning}}", str(context.get("ai_reasoning", "")))
+        
+        # Credentials (Phase 3 fallback)
+        text = text.replace("{{clay_email}}", str(context.get("clay_email", "")))
+        text = text.replace("{{clay_password}}", str(context.get("clay_password", "")))
+        
         return text
     except FileNotFoundError:
         logger.error(f"Directive file not found: {file_path}")
@@ -60,6 +86,98 @@ def run_agent_browser_command(args: list) -> str:
     except Exception as e:
         logger.error(f"Command exception: {e}")
         return str(e)
+
+def parse_ref(snapshot: str, element_label: str) -> str:
+    """Parse snapshot text to find ref (e.g., 'e5') for a given element label."""
+    if not snapshot:
+        return None
+    for line in snapshot.split('\n'):
+        if element_label.lower() in line.lower():
+            # Format: - textbox "email address" [ref=e2]
+            parts = line.split('[ref=')
+            if len(parts) > 1:
+                return parts[1].split(']')[0]
+    return None
+
+def perform_login() -> bool:
+    """
+    Deterministic login flow using the proven test_clay_auth pattern.
+    Returns True on success, raises Exception on failure.
+    """
+    email = os.getenv("CLAY_EMAIL")
+    password = os.getenv("CLAY_PASSWORD")
+    
+    if not email or not password:
+        logger.error("CLAY_EMAIL or CLAY_PASSWORD not set in environment")
+        raise ValueError("CLAY_EMAIL or CLAY_PASSWORD not set in environment")
+    
+    # STEP 1: Open login page + LONG WAIT (React app render)
+    logger.info("Login Step 1: Opening login page...")
+    run_agent_browser_command(["open", "https://app.clay.com/login"])
+    time.sleep(15)
+    
+    # STEP 2: Snapshot + Fill Email
+    logger.info("Login Step 2: Filling email...")
+    snapshot = run_agent_browser_command(["snapshot"])
+    email_ref = parse_ref(snapshot, 'textbox "email address"')
+    
+    if not email_ref:
+        logger.error(f"Could not find email field. Snapshot preview: {snapshot[:500]}")
+        raise Exception("Could not find email field")
+    
+    run_agent_browser_command(["fill", f"@{email_ref}", email])
+    
+    # STEP 3: Click Continue (NOT press Enter)
+    cont_ref = parse_ref(snapshot, 'button "Continue"')
+    if cont_ref:
+        logger.info(f"Clicking Continue (@{cont_ref})...")
+        run_agent_browser_command(["click", f"@{cont_ref}"])
+    else:
+        logger.info("No Continue button found in snapshot, pressing Enter...")
+        run_agent_browser_command(["press", "Enter"])
+    
+    time.sleep(10)  # Wait for password screen
+    
+    # STEP 4: Snapshot + Fill Password
+    logger.info("Login Step 4: Filling password...")
+    pass_snapshot = run_agent_browser_command(["snapshot"])
+    pass_ref = parse_ref(pass_snapshot, 'textbox "password"')
+    
+    if not pass_ref:
+        # Retry once after 5s
+        logger.info("Password field not found, waiting 5s for retry...")
+        time.sleep(5)
+        pass_snapshot = run_agent_browser_command(["snapshot"])
+        pass_ref = parse_ref(pass_snapshot, 'textbox "password"')
+    
+    if not pass_ref:
+        logger.error(f"Could not find password field after retry. Snapshot preview: {pass_snapshot[:500]}")
+        raise Exception("Could not find password field after retry")
+    
+    run_agent_browser_command(["fill", f"@{pass_ref}", password])
+    
+    # STEP 5: Click Continue
+    cont_ref_2 = parse_ref(pass_snapshot, 'button "Continue"')
+    if cont_ref_2:
+        logger.info(f"Clicking Continue (@{cont_ref_2})...")
+        run_agent_browser_command(["click", f"@{cont_ref_2}"])
+    else:
+        logger.info("No Continue button found for password, pressing Enter...")
+        run_agent_browser_command(["press", "Enter"])
+    
+    time.sleep(25)  # Wait for heavy redirect/security check
+    
+    # STEP 6: Verify success
+    logger.info("Login Step 6: Verifying login success...")
+    final_snapshot = run_agent_browser_command(["snapshot"])
+    current_url = run_agent_browser_command(["get", "url"]).strip()
+    
+    if "login" in current_url.lower() or "Welcome back" in final_snapshot:
+        logger.error(f"Login failed - still on login page. URL: {current_url}")
+        raise Exception("Login failed - still on login page")
+    
+    logger.info(f"Login successful! Current URL: {current_url}")
+    return True
 
 def test_connectivity() -> Dict[str, Any]:
     """Isolates network/rendering issues by visiting a tiny site."""
@@ -115,136 +233,45 @@ def test_clay_access() -> Dict[str, Any]:
 
 def test_clay_auth() -> Dict[str, Any]:
     """Tests if cookies correctly grant access to the workbook, and falls back to login if needed."""
-    logger.info("Starting Clay auth test with auto-login fallback...")
+    logger.info("Starting Clay auth test with deterministic login fallback...")
     target_url = "https://app.clay.com/workspaces/579795/w/find-people?destinationTableId=t_0t6pb5u5rFNYudNfngq&workbookId=wb_0t6pb5rpbgD8nRCHvYh"
     
-    # 1. Close any existing daemon to ensure stealth args apply
+    # 1. Prepare session
     run_agent_browser_command(["close"])
     time.sleep(2)
     
-    # 2. Open login page
-    logger.info("Opening login page...")
+    # 2. Inject cookies (initial attempt)
     run_agent_browser_command(["open", "https://app.clay.com/login"])
-    time.sleep(15)
-    
-    # 3. Inject cookies after opening page (to have domain context)
+    time.sleep(5)
     inject_cookies("session_cookies.json")
     
-    # 4. Try to open target URL (might already be logged in if cookies worked)
+    # 3. Try target URL
     logger.info("Opening target URL...")
     run_agent_browser_command(["open", target_url])
     time.sleep(15) 
     
-    snapshot_res = run_agent_browser_command(["snapshot"])
+    snapshot = run_agent_browser_command(["snapshot"])
     current_url = run_agent_browser_command(["get", "url"]).strip()
     
-    # Check if we are on the login page or session expired
-    if "Welcome back" in snapshot_res or "expired=true" in current_url:
-        logger.info("Session expired or not found. Attempting Auto-Login...")
-        
-        email = os.getenv("CLAY_EMAIL")
-        password = os.getenv("CLAY_PASSWORD")
-        
-        if not email or not password:
-            return {"status": "error", "message": "Credentials missing in ENV", "url": current_url}
+    # 4. Fallback to deterministic login if needed
+    if "login" in current_url.lower() or "Welcome back" in snapshot:
+        logger.info("Session invalid. Launching deterministic login...")
+        try:
+            perform_login()
+            # Re-open target after success
+            logger.info("Re-opening target workbook URL after login...")
+            run_agent_browser_command(["open", target_url])
+            time.sleep(15)
+            snapshot = run_agent_browser_command(["snapshot"])
+            current_url = run_agent_browser_command(["get", "url"]).strip()
+        except Exception as e:
+            return {"status": "error", "message": f"Deterministic login failed: {e}", "url": current_url}
 
-        # Step 1: Email
-        # Find ref for email textbox
-        email_ref = None
-        for line in snapshot_res.split('\n'):
-            if 'textbox "email address"' in line:
-                # Format: - textbox "email address" [ref=e2]
-                parts = line.split('[ref=')
-                if len(parts) > 1:
-                    email_ref = parts[1].split(']')[0]
-                    break
-        
-        if email_ref:
-            logger.info(f"Filling email: {email} into {email_ref}")
-            run_agent_browser_command(["fill", f"@{email_ref}", email])
-            # Find ref for Continue button
-            cont_ref = None
-            for line in snapshot_res.split('\n'):
-                if 'button "Continue"' in line:
-                    parts = line.split('[ref=')
-                    if len(parts) > 1:
-                        cont_ref = parts[1].split(']')[0]
-                        break
-            if cont_ref:
-                run_agent_browser_command(["click", f"@{cont_ref}"])
-            else:
-                run_agent_browser_command(["press", "Enter"])
-        else:
-            return {"status": "error", "message": "Could not find email field", "snapshot": snapshot_res[:500]}
-            
-        time.sleep(8)
-        
-        # Step 2: Password
-        login_snap = run_agent_browser_command(["snapshot"])
-        pass_ref = None
-        for line in login_snap.split('\n'):
-            if 'textbox "password"' in line:
-                parts = line.split('[ref=')
-                if len(parts) > 1:
-                    pass_ref = parts[1].split(']')[0]
-                    break
-        
-        if pass_ref:
-            logger.info(f"Filling password into {pass_ref}...")
-            run_agent_browser_command(["fill", f"@{pass_ref}", password])
-            # Click Continue again
-            cont_ref_2 = None
-            for line in login_snap.split('\n'):
-                if 'button "Continue"' in line:
-                    parts = line.split('[ref=')
-                    if len(parts) > 1:
-                        cont_ref_2 = parts[1].split(']')[0]
-                        break
-            if cont_ref_2:
-                run_agent_browser_command(["click", f"@{cont_ref_2}"])
-            else:
-                run_agent_browser_command(["press", "Enter"])
-        else:
-            return {"status": "error", "message": "Could not find password field", "snapshot": login_snap[:500]}
-
-        time.sleep(25) # Wait for heavy redirect/security check
-        
-        # Step 3: Verification
-        final_snap = run_agent_browser_command(["snapshot"])
-        current_url = run_agent_browser_command(["get", "url"]).strip()
-        
-        if "Verify your email" in final_snap or "verify-your-email" in current_url:
-            logger.info("SECURITY CHECK: 'Verify your email' page detected.")
-            run_agent_browser_command(["screenshot", "diagnostics/clay_verify_page.png"])
-            
-            # Find Resend ref
-            resend_ref = None
-            for line in final_snap.split('\n'):
-                if 'Resend verification link' in line:
-                    parts = line.split('[ref=')
-                    if len(parts) > 1:
-                        resend_ref = parts[1].split(']')[0]
-                        break
-            
-            if resend_ref:
-                logger.info(f"Clicking 'Resend verification link' (@{resend_ref}) to trigger email...")
-                run_agent_browser_command(["click", f"@{resend_ref}"])
-            
-            logger.info("Email triggered. Waiting 60s for user to verify via email...")
-            time.sleep(60)
-
-    # 4. Final Verification
-    final_snap = run_agent_browser_command(["snapshot"])
-    run_agent_browser_command(["screenshot", "diagnostics/clay_final_auth.png"])
-    
-    is_logged_in = "Welcome" not in final_snap and ("Search" in final_snap or "Find" in final_snap)
-    
-    return {
-        "status": "success" if is_logged_in else "error",
-        "logged_in": is_logged_in,
-        "url": run_agent_browser_command(["get", "url"]).strip(),
-        "snapshot_preview": final_snap[:500]
-    }
+    # 5. Final validation
+    if "workbook" in current_url.lower() or "find-people" in current_url.lower():
+        return {"status": "success", "message": "Authenticated successfully", "url": current_url}
+    else:
+        return {"status": "error", "message": "Failed to reach target workbook", "url": current_url, "snapshot_preview": snapshot[:500]}
 
 def inject_cookies(file_path: str):
     """Loads cookies from JSON and injects them into agent-browser."""
@@ -269,6 +296,102 @@ def inject_cookies(file_path: str):
         logger.info("Cookie injection complete.")
     except Exception as e:
         logger.error(f"Failed to inject cookies: {e}")
+
+def interpret_search_criteria(jobseeker: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Uses Gemini to intelligently interpret raw Airtable JobSeeker data
+    and generate optimized Clay search criteria.
+    
+    The AI considers:
+    - TargetTitles: selects 3-5 most relevant
+    - TargetGeos: simplifies if too many locations
+    - Seniority: maps to Clay dropdown values
+    - Industries: selects top 3-5
+    - ExcludeKeywords: used directly
+    
+    Returns a dict with optimized search parameters.
+    """
+    logger.info(f"Interpreting search criteria for JobSeeker: {jobseeker.get('id')}")
+    
+    model = GenerativeModel("gemini-2.5-flash")
+    
+    # Build the prompt with all available JobSeeker data
+    prompt = f"""You are a recruiting specialist. Analyze this JobSeeker profile and generate 
+optimized search criteria for Clay.com's People Search.
+
+JOB SEEKER DATA:
+- Name: {jobseeker.get('name', 'Unknown')}
+- Target Titles: {jobseeker.get('targetTitles', '')}
+- Target Geos: {jobseeker.get('targetGeos', '')}
+- Seniority: {jobseeker.get('seniority', '')}
+- Industries: {jobseeker.get('targetIndustries', '')}
+- Include Keywords: {jobseeker.get('includeKeywords', '')}
+- Exclude Keywords: {jobseeker.get('excludeKeywords', '')}
+- Notes: {jobseeker.get('notesForCoach', '')}
+
+RULES:
+1. Select 3-5 most relevant job titles (avoid over-filtering)
+2. For geography: if >5 locations, consolidate to 2-3 primary metro areas or "United States"
+3. Map seniority to Clay values: C-suite, VP, Director, Manager, Senior, Lead/Principal, Mid-Level, Entry-Level
+4. Select top 3 industries if many are listed
+5. Keep excludeKeywords as-is (use for job titles to exclude)
+6. CRITICAL GUARDRAILS:
+   - Country must match original intent (if US, don't suggest India)
+   - Seniority range should be +/- 1 level from stated preference
+   - Domain/industry must be relevant to stated preferences
+
+Return ONLY valid JSON (no markdown, no explanation):
+{{
+  "titles": ["title1", "title2", "title3"],
+  "locations": ["city1", "city2"],
+  "seniority": ["VP", "Director"],
+  "industries": ["Technology", "Financial Services"],
+  "excludeKeywords": ["keyword1", "keyword2"],
+  "confidence": "high",
+  "reasoning": "Brief explanation of choices"
+}}
+"""
+    
+    try:
+        response = call_with_retry(model.generate_content, prompt)
+        raw_text = response.text.strip()
+        
+        # Clean up markdown code blocks if present
+        if raw_text.startswith("```json"):
+            raw_text = raw_text[7:]
+        if raw_text.startswith("```"):
+            raw_text = raw_text[3:]
+        if raw_text.endswith("```"):
+            raw_text = raw_text[:-3]
+        raw_text = raw_text.strip()
+        
+        criteria = json.loads(raw_text)
+        logger.info(f"AI interpreted criteria: {json.dumps(criteria, indent=2)}")
+        
+        # Validate guardrails
+        if not criteria.get("titles"):
+            raise ValueError("No titles generated")
+        if not criteria.get("locations"):
+            raise ValueError("No locations generated")
+        
+        return criteria
+        
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse AI response as JSON: {e}")
+        logger.error(f"Raw response: {raw_text[:500]}")
+        # Fallback: use raw Airtable data directly
+        return {
+            "titles": jobseeker.get("targetTitles", "").split("\n")[:5],
+            "locations": jobseeker.get("targetGeos", "").split("\n")[:3],
+            "seniority": [jobseeker.get("seniority", "Manager")],
+            "industries": jobseeker.get("targetIndustries", "").split("\n")[:3],
+            "excludeKeywords": jobseeker.get("excludeKeywords", "").split("\n"),
+            "confidence": "fallback",
+            "reasoning": "AI parsing failed, using raw Airtable data"
+        }
+    except Exception as e:
+        logger.error(f"Error interpreting criteria: {e}")
+        raise
 
 def run_automation_for_jobseeker(jobseeker: Dict[str, Any]):
     """
@@ -295,9 +418,48 @@ def run_automation_for_jobseeker(jobseeker: Dict[str, Any]):
     
     logger.info("Re-opening target URL with cookies...")
     run_agent_browser_command(["open", CLAY_URL])
+    time.sleep(10) # Wait for initial redirect check
     
-    # 2. Load Directive
-    directive_text = load_directive("clay_directive.md", jobseeker)
+    # Check if login is needed (cookies might have failed/expired)
+    snapshot = run_agent_browser_command(["snapshot"])
+    current_url = run_agent_browser_command(["get", "url"]).strip()
+    
+    if "login" in current_url.lower() or "Welcome back" in snapshot:
+        logger.info("Login required or cookies expired. Launching deterministic login...")
+        perform_login()
+        # After login, re-open the target URL to ensure we are on the workbook
+        logger.info("Re-opening target workbook URL after login...")
+        run_agent_browser_command(["open", CLAY_URL])
+        time.sleep(10)
+    
+    # 2. AI Interpretation of Search Criteria (Phase 3 addition)
+    logger.info("Interpreting search criteria via Gemini AI...")
+    search_criteria = interpret_search_criteria(jobseeker)
+    logger.info(f"AI-interpreted search criteria: {json.dumps(search_criteria, indent=2)}")
+    
+    # Merge AI criteria with jobseeker context for directive
+    jobseeker_with_criteria = {
+        **jobseeker,
+        "ai_titles": search_criteria.get("titles", []),
+        "ai_locations": search_criteria.get("locations", []),
+        "ai_seniority": search_criteria.get("seniority", []),
+        "ai_industries": search_criteria.get("industries", []),
+        "ai_excludeKeywords": search_criteria.get("excludeKeywords", []),
+        "ai_confidence": search_criteria.get("confidence", "unknown"),
+        "ai_reasoning": search_criteria.get("reasoning", ""),
+        # Credentials for fallback login
+        "clay_email": os.getenv("CLAY_EMAIL", ""),
+        "clay_password": os.getenv("CLAY_PASSWORD", "")
+    }
+
+    
+    # 3. Load Directive with AI-enhanced context
+    # Fixed path: assume running from project root or ensure path exists
+    directive_path = "directives/clay_directive.md"
+    if not os.path.exists(directive_path):
+        directive_path = "execution/clay_directive.md" # Fallback checks
+    
+    directive_text = load_directive(directive_path, jobseeker_with_criteria)
     
     # 3. Initialize Model
     model = GenerativeModel("gemini-2.5-flash") # Upgraded to 2.5 Flash as requested (Verified)
@@ -330,10 +492,15 @@ Decide the next action based on the Directive and current state.
 Return ONLY a JSON object with one of these structures:
 {{"type": "click", "element_id": "@eX", "reason": "why"}}
 {{"type": "fill", "element_id": "@eX", "value": "text", "reason": "why"}}
+{{"type": "press", "key": "Enter", "reason": "Use for Enter, Escape, or other keys"}}
 {{"type": "done", "reason": "why"}}
 {{"type": "fail", "reason": "why"}}
 """
-        response = chat.send_message(prompt)
+        try:
+            response = call_with_retry(chat.send_message, prompt)
+        except Exception as e:
+            logger.error(f"AI decision failed after retries: {e}")
+            raise
         raw_text = response.text.strip()
         
         # Clean up markdown code blocks if present
@@ -375,6 +542,12 @@ Return ONLY a JSON object with one of these structures:
             run_agent_browser_command(["fill", eid, val])
             # Often need to press enter for pills
             run_agent_browser_command(["press", "Enter"]) 
+            run_agent_browser_command(["press", "Enter"]) 
+            time.sleep(1)
+            
+        elif action_type == "press":
+            key = action.get("key", "Enter")
+            run_agent_browser_command(["press", key])
             time.sleep(1)
             
         else:

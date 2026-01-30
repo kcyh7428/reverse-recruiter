@@ -614,21 +614,32 @@ Return ONLY a JSON object with one of these structures:
 
         elif action_type == "done":
             logger.info(f"Agent signaled completion. Reason: {action.get('reason')}")
-            # Verify completion: check that we're on the right page and filters were applied
-            verify_snapshot = run_agent_browser_command(["snapshot"])
+            # Verify completion: check page state after filters + "Add to table" click
             verify_url = run_agent_browser_command(["get", "url"]).strip()
-            # Must be on Clay workbook/find-people page (not login, not random page)
+            logger.info(f"Completion check URL: {verify_url}")
+            # Reject: still on login page
             if "login" in verify_url.lower():
-                logger.warning("Completion rejected: still on login page. Continuing...")
-                last_error = "You are still on the login page. The task is NOT done. Continue with the directive."
+                logger.warning("Completion rejected: still on login page.")
+                last_error = "You are still on the login page. The task is NOT done."
                 continue
-            # Must have applied filters — check for evidence of filter activity
-            # Look for "Add to table" button or result count as evidence we're on the search page
-            if "Add to table" not in verify_snapshot and "find-people" not in verify_url.lower():
-                logger.warning(f"Completion rejected: not on search page. URL: {verify_url}")
-                last_error = "The task is NOT done. You must apply all filters and click 'Add to table'. Check the directive steps."
-                continue
-            logger.info("Completion verified. URL and page state look correct.")
+            # Accept: page transitioned to table/workbook view (expected after "Add to table")
+            if "workbook" in verify_url.lower() or "table" in verify_url.lower():
+                if "find-people" not in verify_url.lower():
+                    logger.info("Completion verified: page transitioned to table view after import.")
+                    return True
+            # Reject: still on find-people page with "Add to table" visible
+            if "find-people" in verify_url.lower():
+                verify_snapshot = run_agent_browser_command(["snapshot"])
+                if "Add to table" in verify_snapshot:
+                    logger.warning("Completion rejected: still on filter page.")
+                    last_error = "You must click 'Add to table' before signaling done."
+                    continue
+                else:
+                    # On find-people but Add to table is gone — may have been clicked
+                    logger.info("Completion verified: on find-people but Add to table button gone.")
+                    return True
+            # Default accept: not on login, not on find-people — likely transitioned
+            logger.info(f"Completion accepted (default): URL={verify_url}")
             return True
         elif action_type == "fail":
             logger.error(f"Agent reported failure: {action.get('reason')}")
@@ -717,7 +728,15 @@ Return ONLY a JSON object with one of these structures:
             val = action.get("value")
 
             # Split comma-separated values into individual entries
-            values = [v.strip() for v in val.split(",") if v.strip()] if "," in val else [val]
+            # But preserve city names like "San Francisco, CA" — don't split if any part is ≤3 chars
+            if "," in val:
+                parts = [v.strip() for v in val.split(",") if v.strip()]
+                if len(parts) > 1 and all(len(p) > 3 for p in parts):
+                    values = parts  # All parts substantive → split (e.g., "VP of Sales, Head of Sales")
+                else:
+                    values = [val]  # Short part detected → keep as-is (e.g., "San Francisco, CA")
+            else:
+                values = [val]
             logger.info(f"type_and_enter: {len(values)} value(s) to enter for placeholder '{ph}'")
 
             any_error = None

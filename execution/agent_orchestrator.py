@@ -664,7 +664,13 @@ Return ONLY a JSON object with one of these structures:
                 logger.info("Auto-recovery succeeded: 'Add to table' clicked. Returning success.")
                 return True
             else:
-                logger.error("Auto-recovery failed: 'Add to table' button not found.")
+                # Button not found — check if page already transitioned (button was clicked in a previous turn)
+                check_url = run_agent_browser_command(["get", "url"]).strip()
+                logger.info(f"Auto-recovery: button not found, checking URL: {check_url}")
+                if "find-people" not in check_url.lower() and "login" not in check_url.lower():
+                    logger.info("Page already transitioned away from filters — import likely completed.")
+                    return True
+                logger.error("Auto-recovery failed: 'Add to table' button not found and page hasn't transitioned.")
                 raise Exception(f"Agent Failure: {action.get('reason')}")
             
         elif action_type == "click":
@@ -829,6 +835,11 @@ Return ONLY a JSON object with one of these structures:
                     time.sleep(2)
             else:
                 time.sleep(2)  # Wait for UI reaction
+                # Auto-complete: if we just clicked "Add to table", the import is triggered
+                if "add to table" in btn_text.lower():
+                    logger.info("'Add to table' clicked successfully — import triggered. Returning success.")
+                    time.sleep(3)  # Extra wait for page transition
+                    return True
 
         elif action_type == "scroll":
             direction = action.get("direction", "down")

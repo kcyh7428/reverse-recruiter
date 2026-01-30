@@ -124,6 +124,32 @@ def parse_ref(snapshot: str, element_label: str) -> str:
                 return parts[1].split(']')[0]
     return None
 
+def focus_input_by_text(text: str) -> str:
+    """Focus an input element by placeholder, aria-label, or partial match.
+    Returns the eval result string. Check for 'Element not found' to detect failure."""
+    # Escape quotes for JS
+    safe_text = text.replace('"', '\\"')
+    js_code = f"""
+        let el = document.querySelector('input[placeholder="{safe_text}"]')
+            || document.querySelector('input[aria-label="{safe_text}"]')
+            || document.querySelector('[placeholder="{safe_text}"]')
+            || document.querySelector('[aria-label="{safe_text}"]');
+        if (!el) {{
+            // Partial match fallback
+            let inputs = document.querySelectorAll('input');
+            for (let inp of inputs) {{
+                if ((inp.placeholder && inp.placeholder.includes('{safe_text}'))
+                    || (inp.getAttribute('aria-label') && inp.getAttribute('aria-label').includes('{safe_text}'))) {{
+                    el = inp;
+                    break;
+                }}
+            }}
+        }}
+        if (el) {{ el.focus(); el.click(); 'Focused' }}
+        else {{ 'Element not found' }}
+    """
+    return run_agent_browser_command(["eval", js_code])
+
 def perform_login() -> bool:
     """
     Deterministic login flow using the proven test_clay_auth pattern.
@@ -444,8 +470,10 @@ def run_automation_for_jobseeker(jobseeker: Dict[str, Any]):
     directive_text = load_directive(directive_path, jobseeker_with_criteria)
     
     # 3. Initialize chat history for OpenAI
-    # Windowed: keep only last N turns to prevent context overflow (BadRequestError)
-    CHAT_WINDOW_SIZE = 10  # Keep last 10 turn pairs (20 messages)
+    # Directive goes in system message (sent once). Snapshots go in user messages per turn.
+    # Windowed: keep system message + last N turn pairs to prevent context overflow.
+    CHAT_WINDOW_SIZE = 8  # Keep last 8 turn pairs (16 user+assistant messages)
+    system_message = {"role": "system", "content": directive_text}
     chat_messages = []
 
     # 4. Loop
@@ -496,17 +524,13 @@ def run_automation_for_jobseeker(jobseeker: Dict[str, Any]):
             loop_hint = f"\n🔁 LOOP DETECTED: You have repeated the same action ({last_action_key}) {repeat_count} times. You MUST choose a DIFFERENT action type. If you were using focus_placeholder, switch to type_and_enter with the value you want to type. Do NOT repeat the same action.\n"
             logger.warning(f"Loop detected: {last_action_key} repeated {repeat_count} times. Injecting hint.")
 
-        # Think
-        prompt = f"""
-{directive_text}
-
----
-{error_context}{loop_hint}
+        # Think — directive is in system message, only send snapshot + instructions per turn
+        prompt = f"""{error_context}{loop_hint}
 CURRENT PAGE STATE (JSON Snapshot):
 {snapshot_json}
 
 INSTRUCTIONS:
-Decide the next action based on the Directive and current state.
+Decide the next action based on the Directive (in system message) and current page state.
 Return ONLY a JSON object with one of these structures:
 {{"type": "click", "element_id": "@eX", "reason": "why"}}
 {{"type": "fill", "element_id": "@eX", "value": "text", "reason": "why"}}
@@ -523,14 +547,16 @@ Return ONLY a JSON object with one of these structures:
             # Chat history windowing: keep only last N turn pairs to prevent context overflow
             max_messages = CHAT_WINDOW_SIZE * 2  # Each turn = 1 user + 1 assistant message
             if len(chat_messages) > max_messages:
-                # Keep last N messages (trim oldest turns)
                 chat_messages = chat_messages[-max_messages:]
                 logger.info(f"Chat history trimmed to last {CHAT_WINDOW_SIZE} turns ({len(chat_messages)} messages)")
+
+            # Prepend system message (directive) — always present, not counted in window
+            messages_to_send = [system_message] + chat_messages
 
             response = call_with_retry(
                 openai_client.chat.completions.create,
                 model="gpt-4o",
-                messages=chat_messages,
+                messages=messages_to_send,
                 response_format={"type": "json_object"}
             )
             raw_text = response.choices[0].message.content.strip()
@@ -611,13 +637,7 @@ Return ONLY a JSON object with one of these structures:
         elif action_type == "fill_placeholder":
             ph = action.get("placeholder")
             val = action.get("value")
-            # Focus via JS (handles duplicate placeholders), then fill via :focus
-            focus_js = f"""
-                let els = document.querySelectorAll('input[placeholder="{ph}"]');
-                if (els.length > 0) {{ els[0].focus(); els[0].click(); 'Focused' }}
-                else {{ 'Element not found' }}
-            """
-            focus_res = run_agent_browser_command(["eval", focus_js])
+            focus_res = focus_input_by_text(ph)
             if "Element not found" in focus_res:
                 last_error = f"Placeholder '{ph}' not found"
                 logger.warning(last_error)
@@ -634,14 +654,7 @@ Return ONLY a JSON object with one of these structures:
         elif action_type == "fill_label":
             lbl = action.get("label")
             val = action.get("value")
-            # Focus via JS using aria-label or label text, then fill via :focus
-            focus_js = f"""
-                let el = document.querySelector('input[aria-label="{lbl}"]')
-                    || document.querySelector('[placeholder="{lbl}"]');
-                if (el) {{ el.focus(); el.click(); 'Focused' }}
-                else {{ 'Element not found' }}
-            """
-            focus_res = run_agent_browser_command(["eval", focus_js])
+            focus_res = focus_input_by_text(lbl)
             if "Element not found" in focus_res:
                 last_error = f"Label '{lbl}' not found"
                 logger.warning(last_error)
@@ -656,21 +669,9 @@ Return ONLY a JSON object with one of these structures:
                     time.sleep(1)
 
         elif action_type == "focus_placeholder":
-            # Focus an element by placeholder text without typing (for multi-select prep)
+            # Focus an element by placeholder/aria-label without typing
             ph = action.get("placeholder")
-            # Use JS to bypass strict mode (pick first match) as placeholders like "e.g. CEO" are often duplicated
-            js_code = f"""
-                let els = document.querySelectorAll('input[placeholder="{ph}"]');
-                if (els.length > 0) {{
-                    els[0].focus();
-                    els[0].click(); 
-                    'Focused index 0'
-                }} else {{
-                    'Element not found'
-                }}
-            """
-            res = run_agent_browser_command(["eval", js_code])
-            
+            res = focus_input_by_text(ph)
             if "Element not found" in res:
                 last_error = f"Placeholder '{ph}' not found via JS"
                 logger.warning(last_error)
@@ -680,19 +681,13 @@ Return ONLY a JSON object with one of these structures:
 
         elif action_type == "type_and_enter":
             # Type text into a multi-select input then press Enter to create a pill.
-            # Uses JS eval to focus by placeholder, then fill :focus to type.
+            # Uses shared focus helper (supports placeholder + aria-label), then fill :focus.
             ph = action.get("placeholder")
             val = action.get("value")
             if ph:
-                # Focus via JS (handles duplicate placeholders), then fill
-                focus_js = f"""
-                    let els = document.querySelectorAll('input[placeholder="{ph}"]');
-                    if (els.length > 0) {{ els[0].focus(); els[0].click(); 'Focused' }}
-                    else {{ 'Element not found' }}
-                """
-                focus_res = run_agent_browser_command(["eval", focus_js])
+                focus_res = focus_input_by_text(ph)
                 if "Element not found" in focus_res:
-                    last_error = f"Placeholder '{ph}' not found for type_and_enter"
+                    last_error = f"'{ph}' not found for type_and_enter"
                     logger.warning(last_error)
                     continue
                 time.sleep(0.3)

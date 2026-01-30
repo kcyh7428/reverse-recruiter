@@ -519,11 +519,12 @@ def run_automation_for_jobseeker(jobseeker: Dict[str, Any]):
              logger.error(f"Snapshot failed: {snapshot_json}")
              raise Exception(f"Browser Snapshot Failed: {snapshot_json}")
 
-        # Truncate snapshot to prevent GPT-4o context overflow (400 BadRequest)
-        MAX_SNAPSHOT_CHARS = 6000
+        # Smart truncation: keep first half + last half to preserve both top nav AND bottom buttons
+        MAX_SNAPSHOT_CHARS = 8000
         if len(snapshot_json) > MAX_SNAPSHOT_CHARS:
-            logger.info(f"Snapshot truncated: {len(snapshot_json)} -> {MAX_SNAPSHOT_CHARS} chars")
-            snapshot_json = snapshot_json[:MAX_SNAPSHOT_CHARS] + "\n... [TRUNCATED — focus on visible elements above]"
+            half = MAX_SNAPSHOT_CHARS // 2
+            logger.info(f"Snapshot truncated: {len(snapshot_json)} -> {MAX_SNAPSHOT_CHARS} chars (first {half} + last {half})")
+            snapshot_json = snapshot_json[:half] + "\n\n... [MIDDLE TRUNCATED] ...\n\n" + snapshot_json[-half:]
         
         # Build prompt with previous error if any
         error_context = ""
@@ -548,6 +549,7 @@ Return ONLY a JSON object with one of these structures:
 {{"type": "fill", "element_id": "@eX", "value": "text", "reason": "why"}}
 {{"type": "type_and_enter", "placeholder": "text", "value": "text", "reason": "Type text and press Enter - use for multi-select pill inputs like job titles, exclusions, cities"}}
 {{"type": "press", "key": "Enter", "reason": "Use for Enter, Escape, or other keys"}}
+{{"type": "click_by_text", "text": "Add to table", "reason": "Click a button by its visible text (use when element ref is not in snapshot)"}}
 {{"type": "scroll", "direction": "down", "pixels": 300, "reason": "Scroll to reveal hidden sections"}}
 {{"type": "done", "reason": "why"}}
 {{"type": "fail", "reason": "why"}}
@@ -710,32 +712,68 @@ Return ONLY a JSON object with one of these structures:
 
         elif action_type == "type_and_enter":
             # Type text into a multi-select input then press Enter to create a pill.
-            # Uses shared focus helper (supports placeholder + aria-label), then fill :focus.
-            # After first pill entry, placeholder may disappear — fallback to fill :focus directly.
+            # If value contains commas, split and enter each individually.
             ph = action.get("placeholder")
             val = action.get("value")
-            if ph:
-                focus_res = focus_input_by_text(ph)
-                if "Element not found" in focus_res:
-                    # Fallback: try fill :focus directly (input may still be focused from last pill)
-                    logger.info(f"Placeholder '{ph}' not found, trying fill :focus directly")
-                    res = run_agent_browser_command(["fill", ":focus", val])
+
+            # Split comma-separated values into individual entries
+            values = [v.strip() for v in val.split(",") if v.strip()] if "," in val else [val]
+            logger.info(f"type_and_enter: {len(values)} value(s) to enter for placeholder '{ph}'")
+
+            any_error = None
+            for i, single_val in enumerate(values):
+                # Focus the input (first time by placeholder, subsequent by :focus fallback)
+                if ph and i == 0:
+                    focus_res = focus_input_by_text(ph)
+                    if "Element not found" in focus_res:
+                        logger.info(f"Placeholder '{ph}' not found, trying fill :focus directly")
+                elif ph and i > 0:
+                    # After first pill, placeholder may disappear — re-focus
+                    focus_res = focus_input_by_text(ph)
+                    if "Element not found" in focus_res:
+                        logger.info(f"Placeholder gone after pill {i}, using :focus fallback")
+
+                time.sleep(0.3)
+                res = run_agent_browser_command(["fill", ":focus", single_val])
+
+                if res.startswith("Error:"):
+                    any_error = res
+                    logger.warning(f"Type (Fill) failed for '{single_val}': {res}")
+                    break
                 else:
-                    time.sleep(0.3)
-                    res = run_agent_browser_command(["fill", ":focus", val])
-            else:
-                logger.warning("type_and_enter without placeholder - attempting direct fill")
-                res = run_agent_browser_command(["fill", ":focus", val])
+                    run_agent_browser_command(["press", "Enter"])
+                    time.sleep(1)
+                    run_agent_browser_command(["press", "Enter"])  # Double enter for Clay pills
+                    time.sleep(0.5)
+                    logger.info(f"Pill {i+1}/{len(values)} entered: '{single_val}'")
+
+            if any_error:
+                last_error = any_error
             
-            if res.startswith("Error:"):
+        elif action_type == "click_by_text":
+            # Click a button/link by its visible text content using JS.
+            # Useful when element ref is not visible in truncated snapshot.
+            btn_text = action.get("text", "")
+            safe_text = btn_text.replace('"', '\\"')
+            click_js = f"""
+                let btns = document.querySelectorAll('button, a, [role="button"]');
+                let found = null;
+                for (let b of btns) {{
+                    if (b.textContent.trim().includes('{safe_text}')) {{
+                        found = b;
+                        break;
+                    }}
+                }}
+                if (found) {{ found.click(); 'Clicked: ' + found.textContent.trim() }}
+                else {{ 'Button not found: {safe_text}' }}
+            """
+            res = run_agent_browser_command(["eval", click_js])
+            logger.info(f"click_by_text result: {res}")
+            if "Button not found" in res:
                 last_error = res
-                logger.warning(f"Type (Fill) failed: {res}")
             else:
-                run_agent_browser_command(["press", "Enter"])
-                time.sleep(1)
-                run_agent_browser_command(["press", "Enter"])  # Double enter for Clay pills
-                time.sleep(0.5)
-            
+                time.sleep(2)  # Wait for UI reaction
+
         elif action_type == "scroll":
             direction = action.get("direction", "down")
             pixels = action.get("pixels", 500)

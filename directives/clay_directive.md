@@ -32,14 +32,15 @@ You are controlling a browser on Clay.com's People Search interface. Your goal i
 
 ### Filter Application Steps
 
-#### Company Attributes Section
-1. **Expand "Company attributes" section** (click the accordion header)
+#### Company Attributes Section (Optional — skip if not visible)
+1. If visible, expand "Company attributes" section (click the accordion header)
 2. **Set Industries:**
     - Click the "Industries to include" dropdown (aria-label='Industries to include')
     - Type each industry from {{ai_industries}}
     - Wait for suggestions to appear, then click the matching option
     - Pill appears when selected
 3. **IMPORTANT:** Press ESC after each dropdown/input to close it before moving to the next
+4. If this section is not visible or cannot be found, skip it and proceed to Job Title.
 
 #### Job Title Section
 1. **Expand "Job title" section** (click the accordion header)
@@ -69,18 +70,14 @@ You are controlling a browser on Clay.com's People Search interface. Your goal i
 
 ### Import Profiles
 
-1. **Check preview panel** for result count
-2. **Set Limit (REQUIRES SCROLLING):**
-    - **Scroll down** in the left filter panel (large scroll like 1000px) to find "Limit results" section at the very bottom.
-    - Expand "Limit results" section if collapsed
-    - Click the "Limit" input field (placeholder='e.g. 10', default value is **20**)
-    - **Clear existing value:** Press `Ctrl+A` (or `Cmd+A` on Mac) to select all, then `Backspace` to delete
-    - Type "100"
-    - Press Enter to confirm
-3. **Click "Add to table"** button
-    - Action: `{"type": "click", "element_id": "Add to table"}` (or find button with text "Add to table")
-4. **Handle confirmation modal:** Click the confirm button if it appears
-5. **Wait for import notification**
+1. **After applying all filters** (seniority, titles, exclusions, location), proceed to import.
+2. **Click "Add to table"** button — look for a button with text "Add to table" in the page.
+    - If you can see the button, click it directly.
+    - If you cannot see it, scroll down or look in the bottom/right area of the filter panel.
+    - Action: `{"type": "click", "element_id": "@eX", "reason": "Click Add to table button"}`
+3. **Handle confirmation modal:** If a confirmation dialog appears, click the confirm/OK button.
+4. **Wait for screen change** — after clicking "Add to table", the page should transition away from the filter view.
+5. **Signal done** once the import has been triggered and the screen has changed.
 
 ### Resilience & Error Handling
 
@@ -89,3 +86,5 @@ You are controlling a browser on Clay.com's People Search interface. Your goal i
    - Look for a different element that might be more specific.
    - Or try to click a parent/related element first to clarify the UI state.
 2. **Missing Elements:** If an element from the directive is missing, try expanding sections or scrolling before failing.
+3. **Do NOT signal "done" until** you have clicked "Add to table" and seen the page transition. Applying filters alone is NOT completion — you must import the profiles.
+4. **Do NOT signal "fail"** just because you cannot find one filter section. Skip it and proceed to the next step. Only fail if you cannot reach the "Add to table" button at all.

@@ -611,26 +611,49 @@ Return ONLY a JSON object with one of these structures:
         elif action_type == "fill_placeholder":
             ph = action.get("placeholder")
             val = action.get("value")
-            # Uses agent-browser find command: find placeholder <ph> fill <val>
-            res = run_agent_browser_command(["find", "placeholder", ph, "fill", val])
-            if res.startswith("Error:"):
-                last_error = res
-                logger.warning(f"Fill-Placeholder failed: {res}")
+            # Focus via JS (handles duplicate placeholders), then fill via :focus
+            focus_js = f"""
+                let els = document.querySelectorAll('input[placeholder="{ph}"]');
+                if (els.length > 0) {{ els[0].focus(); els[0].click(); 'Focused' }}
+                else {{ 'Element not found' }}
+            """
+            focus_res = run_agent_browser_command(["eval", focus_js])
+            if "Element not found" in focus_res:
+                last_error = f"Placeholder '{ph}' not found"
+                logger.warning(last_error)
             else:
-                run_agent_browser_command(["press", "Enter"]) 
-                time.sleep(1)
+                time.sleep(0.3)
+                res = run_agent_browser_command(["fill", ":focus", val])
+                if res.startswith("Error:"):
+                    last_error = res
+                    logger.warning(f"Fill-Placeholder failed: {res}")
+                else:
+                    run_agent_browser_command(["press", "Enter"])
+                    time.sleep(1)
 
         elif action_type == "fill_label":
             lbl = action.get("label")
             val = action.get("value")
-            # Uses agent-browser find command: find label <lbl> fill <val>
-            res = run_agent_browser_command(["find", "label", lbl, "fill", val])
-            if res.startswith("Error:"):
-                last_error = res
-                logger.warning(f"Fill-Label failed: {res}")
+            # Focus via JS using aria-label or label text, then fill via :focus
+            focus_js = f"""
+                let el = document.querySelector('input[aria-label="{lbl}"]')
+                    || document.querySelector('[placeholder="{lbl}"]');
+                if (el) {{ el.focus(); el.click(); 'Focused' }}
+                else {{ 'Element not found' }}
+            """
+            focus_res = run_agent_browser_command(["eval", focus_js])
+            if "Element not found" in focus_res:
+                last_error = f"Label '{lbl}' not found"
+                logger.warning(last_error)
             else:
-                run_agent_browser_command(["press", "Enter"]) 
-                time.sleep(1)
+                time.sleep(0.3)
+                res = run_agent_browser_command(["fill", ":focus", val])
+                if res.startswith("Error:"):
+                    last_error = res
+                    logger.warning(f"Fill-Label failed: {res}")
+                else:
+                    run_agent_browser_command(["press", "Enter"])
+                    time.sleep(1)
 
         elif action_type == "focus_placeholder":
             # Focus an element by placeholder text without typing (for multi-select prep)
@@ -656,17 +679,26 @@ Return ONLY a JSON object with one of these structures:
                 time.sleep(0.5)
 
         elif action_type == "type_and_enter":
-            # Type text WITHOUT clearing existing content, then press Enter
-            # This is critical for multi-select inputs where each value becomes a pill
-            # USAGE: agent-browser find placeholder <ph> fill <val>
-            # Note: Switched from 'type' to 'fill' due to validation errors in CLI version
+            # Type text into a multi-select input then press Enter to create a pill.
+            # Uses JS eval to focus by placeholder, then fill :focus to type.
             ph = action.get("placeholder")
             val = action.get("value")
             if ph:
-                # Use find + fill pattern
-                res = run_agent_browser_command(["find", "placeholder", ph, "fill", val])
+                # Focus via JS (handles duplicate placeholders), then fill
+                focus_js = f"""
+                    let els = document.querySelectorAll('input[placeholder="{ph}"]');
+                    if (els.length > 0) {{ els[0].focus(); els[0].click(); 'Focused' }}
+                    else {{ 'Element not found' }}
+                """
+                focus_res = run_agent_browser_command(["eval", focus_js])
+                if "Element not found" in focus_res:
+                    last_error = f"Placeholder '{ph}' not found for type_and_enter"
+                    logger.warning(last_error)
+                    continue
+                time.sleep(0.3)
+                res = run_agent_browser_command(["fill", ":focus", val])
             else:
-                # Fallback: type to last focused element
+                # Fallback: fill the currently focused element
                 logger.warning("type_and_enter without placeholder - attempting direct fill")
                 res = run_agent_browser_command(["fill", ":focus", val])
             

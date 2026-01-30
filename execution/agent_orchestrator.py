@@ -486,8 +486,10 @@ def run_automation_for_jobseeker(jobseeker: Dict[str, Any]):
         log_resource_diagnostics(turn)
         logger.info(f"Turn {turn}: Snapshotting...")
 
-        # Browser Recycling (insurance — VPS has real /dev/shm so less critical)
-        if turn % 15 == 0 and turn > 0:
+        # Browser Recycling (insurance — VPS has real /dev/shm so rarely needed)
+        # Increased from 15 to 50 turns: recycling wipes all applied filters,
+        # so it should only happen as a last resort for resource leaks.
+        if turn % 50 == 0 and turn > 0:
             logger.info("Recycling browser daemon to free resources...")
             run_agent_browser_command(["close"])
             time.sleep(5)
@@ -542,6 +544,7 @@ Return ONLY a JSON object with one of these structures:
 {{"type": "fill_label", "label": "text", "value": "text", "reason": "Use if targeting by label"}}
 {{"type": "type_and_enter", "placeholder": "text", "value": "text", "reason": "Type text and press Enter - use for multi-select pills (does NOT clear existing content)"}}
 {{"type": "press", "key": "Enter", "reason": "Use for Enter, Escape, or other keys"}}
+{{"type": "scroll", "direction": "down", "pixels": 500, "reason": "Scroll the filter panel to reveal hidden sections like Limit results"}}
 {{"type": "done", "reason": "why"}}
 {{"type": "fail", "reason": "why"}}
 """
@@ -726,6 +729,22 @@ Return ONLY a JSON object with one of these structures:
                 run_agent_browser_command(["press", "Enter"])  # Double enter for Clay pills
                 time.sleep(0.5)
             
+        elif action_type == "scroll":
+            direction = action.get("direction", "down")
+            pixels = action.get("pixels", 500)
+            sign = "" if direction == "down" else "-"
+            # Try scrolling the filter panel first, fall back to window scroll
+            scroll_js = f"""
+                let panel = document.querySelector('[class*="sidebar"]')
+                    || document.querySelector('[class*="filter"]')
+                    || document.querySelector('[class*="panel"]');
+                if (panel) {{ panel.scrollBy(0, {sign}{pixels}); 'Scrolled panel' }}
+                else {{ window.scrollBy(0, {sign}{pixels}); 'Scrolled window' }}
+            """
+            res = run_agent_browser_command(["eval", scroll_js])
+            logger.info(f"Scroll result: {res}")
+            time.sleep(1)
+
         else:
             logger.warning(f"Unknown action type: {action_type}")
             last_error = f"Unknown action type: {action_type}"

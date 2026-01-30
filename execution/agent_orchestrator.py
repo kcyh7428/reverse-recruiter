@@ -682,18 +682,19 @@ Return ONLY a JSON object with one of these structures:
         elif action_type == "type_and_enter":
             # Type text into a multi-select input then press Enter to create a pill.
             # Uses shared focus helper (supports placeholder + aria-label), then fill :focus.
+            # After first pill entry, placeholder may disappear — fallback to fill :focus directly.
             ph = action.get("placeholder")
             val = action.get("value")
             if ph:
                 focus_res = focus_input_by_text(ph)
                 if "Element not found" in focus_res:
-                    last_error = f"'{ph}' not found for type_and_enter"
-                    logger.warning(last_error)
-                    continue
-                time.sleep(0.3)
-                res = run_agent_browser_command(["fill", ":focus", val])
+                    # Fallback: try fill :focus directly (input may still be focused from last pill)
+                    logger.info(f"Placeholder '{ph}' not found, trying fill :focus directly")
+                    res = run_agent_browser_command(["fill", ":focus", val])
+                else:
+                    time.sleep(0.3)
+                    res = run_agent_browser_command(["fill", ":focus", val])
             else:
-                # Fallback: fill the currently focused element
                 logger.warning("type_and_enter without placeholder - attempting direct fill")
                 res = run_agent_browser_command(["fill", ":focus", val])
             

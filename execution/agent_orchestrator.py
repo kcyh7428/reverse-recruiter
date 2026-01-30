@@ -502,6 +502,10 @@ def run_automation_for_jobseeker(jobseeker: Dict[str, Any]):
                 run_agent_browser_command(["open", CLAY_URL])
                 time.sleep(10)
             logger.info("Browser recycled successfully.")
+            # Reset chat history after recycling — the browser state is fresh,
+            # so old context about previous actions is misleading.
+            chat_messages = []
+            logger.info("Chat history cleared after browser recycling.")
 
         
         # Observe
@@ -597,7 +601,22 @@ Return ONLY a JSON object with one of these structures:
              continue # Loop will take a new snapshot at start of next turn
 
         elif action_type == "done":
-            logger.info("Agent signaled completion.")
+            logger.info(f"Agent signaled completion. Reason: {action.get('reason')}")
+            # Verify completion: check that we're on the right page and filters were applied
+            verify_snapshot = run_agent_browser_command(["snapshot"])
+            verify_url = run_agent_browser_command(["get", "url"]).strip()
+            # Must be on Clay workbook/find-people page (not login, not random page)
+            if "login" in verify_url.lower():
+                logger.warning("Completion rejected: still on login page. Continuing...")
+                last_error = "You are still on the login page. The task is NOT done. Continue with the directive."
+                continue
+            # Must have applied filters — check for evidence of filter activity
+            # Look for "Add to table" button or result count as evidence we're on the search page
+            if "Add to table" not in verify_snapshot and "find-people" not in verify_url.lower():
+                logger.warning(f"Completion rejected: not on search page. URL: {verify_url}")
+                last_error = "The task is NOT done. You must apply all filters and click 'Add to table'. Check the directive steps."
+                continue
+            logger.info("Completion verified. URL and page state look correct.")
             return True
         elif action_type == "fail":
             logger.error(f"Agent reported failure: {action.get('reason')}")

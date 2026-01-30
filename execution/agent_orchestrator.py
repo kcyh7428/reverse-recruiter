@@ -265,32 +265,19 @@ def test_clay_auth() -> Dict[str, Any]:
     run_agent_browser_command(["close"])
     time.sleep(2)
     
-    # 2. Inject cookies (initial attempt)
-    run_agent_browser_command(["open", "https://app.clay.com/login"])
-    time.sleep(5)
-    inject_cookies("session_cookies.json")
-    
-    # 3. Try target URL
-    logger.info("Opening target URL...")
+    # 2. Perform deterministic login
+    try:
+        perform_login()
+    except Exception as e:
+        return {"status": "error", "message": f"Deterministic login failed: {e}", "url": ""}
+
+    # 3. Try target URL after login
+    logger.info("Opening target workbook URL after login...")
     run_agent_browser_command(["open", target_url])
-    time.sleep(15) 
-    
+    time.sleep(15)
+
     snapshot = run_agent_browser_command(["snapshot"])
     current_url = run_agent_browser_command(["get", "url"]).strip()
-    
-    # 4. Fallback to deterministic login if needed
-    if "login" in current_url.lower() or "Welcome back" in snapshot:
-        logger.info("Session invalid. Launching deterministic login...")
-        try:
-            perform_login()
-            # Re-open target after success
-            logger.info("Re-opening target workbook URL after login...")
-            run_agent_browser_command(["open", target_url])
-            time.sleep(15)
-            snapshot = run_agent_browser_command(["snapshot"])
-            current_url = run_agent_browser_command(["get", "url"]).strip()
-        except Exception as e:
-            return {"status": "error", "message": f"Deterministic login failed: {e}", "url": current_url}
 
     # 5. Final validation
     if "workbook" in current_url.lower() or "find-people" in current_url.lower():

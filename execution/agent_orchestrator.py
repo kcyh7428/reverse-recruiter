@@ -642,8 +642,30 @@ Return ONLY a JSON object with one of these structures:
             logger.info(f"Completion accepted (default): URL={verify_url}")
             return True
         elif action_type == "fail":
-            logger.error(f"Agent reported failure: {action.get('reason')}")
-            raise Exception(f"Agent Failure: {action.get('reason')}")
+            logger.warning(f"Agent reported failure: {action.get('reason')}")
+            # Auto-recovery: try clicking "Add to table" before accepting failure
+            logger.info("Attempting auto-recovery: clicking 'Add to table' via JS...")
+            add_js = """
+                let btns = document.querySelectorAll('button, a, [role="button"], [class*="button"]');
+                let found = null;
+                for (let b of btns) {
+                    if (b.textContent.trim().toLowerCase().includes('add to table')) {
+                        found = b;
+                        break;
+                    }
+                }
+                if (found) { found.scrollIntoView(); found.click(); 'Clicked: ' + found.textContent.trim() }
+                else { 'Button not found' }
+            """
+            add_res = run_agent_browser_command(["eval", add_js])
+            logger.info(f"Auto-recovery result: {add_res}")
+            if "Clicked" in add_res:
+                time.sleep(3)
+                logger.info("Auto-recovery succeeded: 'Add to table' clicked. Returning success.")
+                return True
+            else:
+                logger.error("Auto-recovery failed: 'Add to table' button not found.")
+                raise Exception(f"Agent Failure: {action.get('reason')}")
             
         elif action_type == "click":
             eid = action.get("element_id")

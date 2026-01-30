@@ -4,42 +4,34 @@ import json
 import logging
 import time
 from typing import Dict, Any
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-from google.api_core.exceptions import ResourceExhausted
-
-# Vertex AI imports
-import vertexai
-from vertexai.generative_models import GenerativeModel, Part
+from tenacity import retry, stop_after_attempt, wait_exponential
+from openai import OpenAI
 
 # Valid LOG LEVELS
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Constants
-PROJECT_ID = os.getenv("GCP_PROJECT_ID")
-REGION = os.getenv("GCP_REGION", "us-central1")
-MAX_TURNS = 30  # Increased limit for complex filter flows
+MAX_TURNS = 60  # Increased limit for complex filter flows
 
-@retry(
-    retry=retry_if_exception_type(ResourceExhausted),
-    stop=stop_after_attempt(5),
-    wait=wait_exponential(multiplier=2, min=5, max=60)
-)
+@retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=2, min=5, max=60))
 def call_with_retry(func, *args, **kwargs):
     return func(*args, **kwargs)
 
-try:
-    vertexai.init(project=PROJECT_ID, location=REGION)
-except Exception:
-    logger.warning("Vertex AI init failed. Ensure GCP credentials are correct (Workload Identity).")
+openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # Ensure all agent-browser calls share the same session context for cookie persistence
 os.environ["AGENT_BROWSER_SESSION"] = "clay_automation_session"
 
-# Phase 3: Stealth Mode - Hide automation fingerprints
+# Stealth Mode - Hide automation fingerprints
 # --disable-blink-features=AutomationControlled hides navigator.webdriver
-os.environ["AGENT_BROWSER_ARGS"] = "--no-sandbox,--disable-blink-features=AutomationControlled,--disable-infobars"
-os.environ["AGENT_BROWSER_USER_AGENT"] = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+os.environ["AGENT_BROWSER_ARGS"] = (
+    "--no-sandbox,"
+    "--disable-blink-features=AutomationControlled,"
+    "--disable-infobars,"
+    "--disable-gpu"
+)
+os.environ["AGENT_BROWSER_USER_AGENT"] = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
 def load_directive(file_path: str, context: Dict[str, Any]) -> str:
     """Reads the directive markdown and substitutes placeholders."""
@@ -73,15 +65,48 @@ def load_directive(file_path: str, context: Dict[str, Any]) -> str:
         logger.error(f"Directive file not found: {file_path}")
         return "ERROR: Directive Missing"
 
+def log_resource_diagnostics(turn: int):
+    """Log container resource metrics for debugging EAGAIN issues."""
+    try:
+        shm_proc = subprocess.run(
+            ["df", "-h", "/dev/shm"], capture_output=True, text=True, timeout=5
+        )
+        fd_count = len(os.listdir("/proc/self/fd"))
+        # Phase 6: Log process count to detect process limit (nproc) exhaustion
+        ps_out = subprocess.run(["ps", "-e", "--no-headers"], capture_output=True, text=True)
+        proc_count = len(ps_out.stdout.strip().split('\n')) if ps_out.stdout.strip() else 0
+        
+        logger.info(f"[DIAG] Turn {turn} | SHM: {shm_proc.stdout.strip().splitlines()[-1] if shm_proc.stdout else 'N/A'} | FDs: {fd_count} | Procs: {proc_count}")
+    except Exception as e:
+        logger.warning(f"[DIAG] Turn {turn} diagnostics failed: {e}")
+
 def run_agent_browser_command(args: list) -> str:
     """Runs a subcommand of the agent-browser CLI."""
     try:
         # Full command: agent-browser <args>
         cmd = ["agent-browser"] + args
+        
+        # Local Debugging: Support headed mode via env var
+        if os.environ.get("AGENT_BROWSER_HEADED") == "true" and "open" in args:
+             if "--headed" not in cmd:
+                 cmd.append("--headed")
+
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        
+        # Phase 4 Update: Ignore daemon-already-running warnings in stderr
+        # These warnings can cause a non-zero exit code but the action may still succeed.
+        has_daemon_warning = "daemon already running" in result.stderr
+        
         if result.returncode != 0:
+            # Phase 6: Gracefully handle 'daemon already running' warning.
+            # This can cause a non-zero exit code but doesn't mean the command failed.
+            if "daemon already running" in result.stderr:
+                logger.info("Agent browser daemon already running. Proceeding...")
+                return result.stdout or "Success: Daemon already running"
+            
             logger.error(f"Command failed: {cmd}\nStderr: {result.stderr}\nStdout: {result.stdout}")
             return f"Error: {result.stderr} | {result.stdout}"
+        
         return result.stdout
     except Exception as e:
         logger.error(f"Command exception: {e}")
@@ -273,29 +298,6 @@ def test_clay_auth() -> Dict[str, Any]:
     else:
         return {"status": "error", "message": "Failed to reach target workbook", "url": current_url, "snapshot_preview": snapshot[:500]}
 
-def inject_cookies(file_path: str):
-    """Loads cookies from JSON and injects them into agent-browser."""
-    try:
-        if not os.path.exists(file_path):
-            logger.warning(f"Cookie file not found at {file_path}, skipping injection.")
-            return
-
-        with open(file_path, "r") as f:
-            cookies = json.load(f)
-        
-        logger.info("Clearing existing cookies...")
-        run_agent_browser_command(["cookies", "clear"])
-        
-        logger.info(f"Injecting {len(cookies)} cookies...")
-        for c in cookies:
-            name = c.get("name")
-            value = c.get("value")
-            if name and value:
-                # Command: agent-browser cookies set <name> <value>
-                run_agent_browser_command(["cookies", "set", name, value])
-        logger.info("Cookie injection complete.")
-    except Exception as e:
-        logger.error(f"Failed to inject cookies: {e}")
 
 def interpret_search_criteria(jobseeker: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -313,10 +315,8 @@ def interpret_search_criteria(jobseeker: Dict[str, Any]) -> Dict[str, Any]:
     """
     logger.info(f"Interpreting search criteria for JobSeeker: {jobseeker.get('id')}")
     
-    model = GenerativeModel("gemini-2.5-flash")
-    
     # Build the prompt with all available JobSeeker data
-    prompt = f"""You are a recruiting specialist. Analyze this JobSeeker profile and generate 
+    prompt = f"""You are a recruiting specialist. Analyze this JobSeeker profile and generate
 optimized search criteria for Clay.com's People Search.
 
 JOB SEEKER DATA:
@@ -351,10 +351,15 @@ Return ONLY valid JSON (no markdown, no explanation):
   "reasoning": "Brief explanation of choices"
 }}
 """
-    
+
     try:
-        response = call_with_retry(model.generate_content, prompt)
-        raw_text = response.text.strip()
+        response = call_with_retry(
+            openai_client.chat.completions.create,
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"}
+        )
+        raw_text = response.choices[0].message.content.strip()
         
         # Clean up markdown code blocks if present
         if raw_text.startswith("```json"):
@@ -403,29 +408,19 @@ def run_automation_for_jobseeker(jobseeker: Dict[str, Any]):
     CLAY_URL = "https://app.clay.com/workspaces/579795/w/find-people?destinationTableId=t_0t6pb5u5rFNYudNfngq&workbookId=wb_0t6pb5rpbgD8nRCHvYh"
     
     # Sequence: 
-    # 1. Open target URL (establishes domain app.clay.com)
-    # 2. Inject cookies
-    # 3. Open target URL again (now authenticated)
+    logger.info(f"Preparing workspace for {jobseeker.get('id')}...")
+    # Force close any existing daemon to ensure new args (like --disable-dev-shm-usage) are strictly applied
+    run_agent_browser_command(["close"]) 
+    time.sleep(5) # Increase wait for cleanup
     
     logger.info("Opening target URL to establish domain context...")
     run_agent_browser_command(["open", CLAY_URL])
+    time.sleep(10)
     
-    inject_cookies("session_cookies.json")
-    
-    # DEBUG: Check if cookies are set
-    cookies_check = run_agent_browser_command(["cookies"])
-    logger.info(f"Current Browser Cookies: {cookies_check}")
-    
-    logger.info("Re-opening target URL with cookies...")
-    run_agent_browser_command(["open", CLAY_URL])
-    time.sleep(10) # Wait for initial redirect check
-    
-    # Check if login is needed (cookies might have failed/expired)
+    # Check if login is needed
     snapshot = run_agent_browser_command(["snapshot"])
-    current_url = run_agent_browser_command(["get", "url"]).strip()
-    
-    if "login" in current_url.lower() or "Welcome back" in snapshot:
-        logger.info("Login required or cookies expired. Launching deterministic login...")
+    if "Log in" in snapshot or "Sign in" in snapshot or "login" in snapshot.lower():
+        logger.info("Login required. Launching deterministic login...")
         perform_login()
         # After login, re-open the target URL to ensure we are on the workbook
         logger.info("Re-opening target workbook URL after login...")
@@ -461,29 +456,55 @@ def run_automation_for_jobseeker(jobseeker: Dict[str, Any]):
     
     directive_text = load_directive(directive_path, jobseeker_with_criteria)
     
-    # 3. Initialize Model
-    model = GenerativeModel("gemini-2.5-flash") # Upgraded to 2.5 Flash as requested (Verified)
-    chat = model.start_chat()
-    
+    # 3. Initialize chat history for OpenAI
+    chat_messages = []
+
     # 4. Loop
     turn = 0
+    last_error = None
     while turn < MAX_TURNS:
         turn += 1
+        log_resource_diagnostics(turn)
         logger.info(f"Turn {turn}: Snapshotting...")
+
+        # Browser Recycling (insurance — VPS has real /dev/shm so less critical)
+        if turn % 15 == 0 and turn > 0:
+            logger.info("Recycling browser daemon to free resources...")
+            run_agent_browser_command(["close"])
+            time.sleep(5)
+            # Use deterministic login instead of cookie injection (cookies expire too quickly)
+            run_agent_browser_command(["open", CLAY_URL])
+            time.sleep(10)
+            # Check if login is needed post-recycling
+            snapshot = run_agent_browser_command(["snapshot"])
+            if "Log in" in snapshot or "Sign in" in snapshot or "login" in snapshot.lower():
+                logger.info("Post-recycling login required. Logging in...")
+                perform_login()
+                run_agent_browser_command(["open", CLAY_URL])
+                time.sleep(10)
+            logger.info("Browser recycled successfully.")
+
         
         # Observe
-        snapshot_json = run_agent_browser_command(["snapshot", "--json"])
+        # Use --compact to reduce token usage and prevent payload size errors
+        snapshot_json = run_agent_browser_command(["snapshot", "--json", "--compact"])
         
         # Check for hard failure in snapshot to avoid infinite loop
         if snapshot_json.startswith("Error:"):
              logger.error(f"Snapshot failed: {snapshot_json}")
              raise Exception(f"Browser Snapshot Failed: {snapshot_json}")
         
+        # Build prompt with previous error if any
+        error_context = ""
+        if last_error:
+            error_context = f"\n⚠️ PREVIOUS ACTION FAILED with error:\n{last_error}\nPlease try a different approach (e.g., use a more specific element ID, or a different strategy).\n"
+
         # Think
         prompt = f"""
 {directive_text}
 
 ---
+{error_context}
 CURRENT PAGE STATE (JSON Snapshot):
 {snapshot_json}
 
@@ -492,16 +513,27 @@ Decide the next action based on the Directive and current state.
 Return ONLY a JSON object with one of these structures:
 {{"type": "click", "element_id": "@eX", "reason": "why"}}
 {{"type": "fill", "element_id": "@eX", "value": "text", "reason": "why"}}
+{{"type": "fill_placeholder", "placeholder": "text", "value": "text", "reason": "Use if selector is ambiguous"}}
+{{"type": "fill_label", "label": "text", "value": "text", "reason": "Use if targeting by label"}}
+{{"type": "focus_placeholder", "placeholder": "text", "reason": "Focus input by placeholder without typing (for multi-select prep)"}}
+{{"type": "type_and_enter", "placeholder": "text", "value": "text", "reason": "Type text and press Enter - use for multi-select pills (does NOT clear existing content)"}}
 {{"type": "press", "key": "Enter", "reason": "Use for Enter, Escape, or other keys"}}
 {{"type": "done", "reason": "why"}}
 {{"type": "fail", "reason": "why"}}
 """
         try:
-            response = call_with_retry(chat.send_message, prompt)
+            chat_messages.append({"role": "user", "content": prompt})
+            response = call_with_retry(
+                openai_client.chat.completions.create,
+                model="gpt-4o",
+                messages=chat_messages,
+                response_format={"type": "json_object"}
+            )
+            raw_text = response.choices[0].message.content.strip()
+            chat_messages.append({"role": "assistant", "content": raw_text})
         except Exception as e:
             logger.error(f"AI decision failed after retries: {e}")
             raise
-        raw_text = response.text.strip()
         
         # Clean up markdown code blocks if present
         if raw_text.startswith("```json"):
@@ -515,10 +547,13 @@ Return ONLY a JSON object with one of these structures:
             action = json.loads(raw_text)
         except json.JSONDecodeError:
             logger.error("Failed to parse agent JSON. Retrying...")
+            last_error = f"Invalid JSON returned: {raw_text[:100]}"
             continue
             
         # Act
         action_type = action.get("type")
+        last_error = None  # Reset error before new action
+
         if action_type == "snapshot":
              logger.info("Agent requested explicit snapshot.")
              continue # Loop will take a new snapshot at start of next turn
@@ -532,26 +567,109 @@ Return ONLY a JSON object with one of these structures:
             
         elif action_type == "click":
             eid = action.get("element_id")
-            run_agent_browser_command(["click", eid])
-            time.sleep(2) # Wait for UI reaction
+            res = run_agent_browser_command(["click", eid])
+            if res.startswith("Error:"):
+                last_error = res
+                logger.warning(f"Click failed: {res}")
+            else:
+                time.sleep(2) # Wait for UI reaction
             
         elif action_type == "fill":
             eid = action.get("element_id")
             val = action.get("value")
-            # Clear first? 'fill' usually replaces in agent-browser, but we can be safe
-            run_agent_browser_command(["fill", eid, val])
-            # Often need to press enter for pills
-            run_agent_browser_command(["press", "Enter"]) 
-            run_agent_browser_command(["press", "Enter"]) 
-            time.sleep(1)
+            res = run_agent_browser_command(["fill", eid, val])
+            if res.startswith("Error:"):
+                last_error = res
+                logger.warning(f"Fill failed: {res}")
+            else:
+                # Often need to press enter for pills, but ONLY if fill succeeded
+                run_agent_browser_command(["press", "Enter"]) 
+                run_agent_browser_command(["press", "Enter"]) 
+                time.sleep(1)
             
         elif action_type == "press":
             key = action.get("key", "Enter")
-            run_agent_browser_command(["press", key])
-            time.sleep(1)
+            res = run_agent_browser_command(["press", key])
+            if res.startswith("Error:"):
+                last_error = res
+                logger.warning(f"Press failed: {res}")
+            else:
+                time.sleep(1)
+
+        elif action_type == "fill_placeholder":
+            ph = action.get("placeholder")
+            val = action.get("value")
+            # Uses agent-browser find command: find placeholder <ph> fill <val>
+            res = run_agent_browser_command(["find", "placeholder", ph, "fill", val])
+            if res.startswith("Error:"):
+                last_error = res
+                logger.warning(f"Fill-Placeholder failed: {res}")
+            else:
+                run_agent_browser_command(["press", "Enter"]) 
+                time.sleep(1)
+
+        elif action_type == "fill_label":
+            lbl = action.get("label")
+            val = action.get("value")
+            # Uses agent-browser find command: find label <lbl> fill <val>
+            res = run_agent_browser_command(["find", "label", lbl, "fill", val])
+            if res.startswith("Error:"):
+                last_error = res
+                logger.warning(f"Fill-Label failed: {res}")
+            else:
+                run_agent_browser_command(["press", "Enter"]) 
+                time.sleep(1)
+
+        elif action_type == "focus_placeholder":
+            # Focus an element by placeholder text without typing (for multi-select prep)
+            ph = action.get("placeholder")
+            # Use JS to bypass strict mode (pick first match) as placeholders like "e.g. CEO" are often duplicated
+            js_code = f"""
+                let els = document.querySelectorAll('input[placeholder="{ph}"]');
+                if (els.length > 0) {{
+                    els[0].focus();
+                    els[0].click(); 
+                    'Focused index 0'
+                }} else {{
+                    'Element not found'
+                }}
+            """
+            res = run_agent_browser_command(["eval", js_code])
+            
+            if "Element not found" in res:
+                last_error = f"Placeholder '{ph}' not found via JS"
+                logger.warning(last_error)
+            else:
+                logger.info(f"JS Focus result: {res}")
+                time.sleep(0.5)
+
+        elif action_type == "type_and_enter":
+            # Type text WITHOUT clearing existing content, then press Enter
+            # This is critical for multi-select inputs where each value becomes a pill
+            # USAGE: agent-browser find placeholder <ph> fill <val>
+            # Note: Switched from 'type' to 'fill' due to validation errors in CLI version
+            ph = action.get("placeholder")
+            val = action.get("value")
+            if ph:
+                # Use find + fill pattern
+                res = run_agent_browser_command(["find", "placeholder", ph, "fill", val])
+            else:
+                # Fallback: type to last focused element
+                logger.warning("type_and_enter without placeholder - attempting direct fill")
+                res = run_agent_browser_command(["fill", ":focus", val])
+            
+            if res.startswith("Error:"):
+                last_error = res
+                logger.warning(f"Type (Fill) failed: {res}")
+            else:
+                run_agent_browser_command(["press", "Enter"])
+                time.sleep(1)
+                run_agent_browser_command(["press", "Enter"])  # Double enter for Clay pills
+                time.sleep(0.5)
             
         else:
             logger.warning(f"Unknown action type: {action_type}")
+            last_error = f"Unknown action type: {action_type}"
             
     logger.warning("Max turns reached without completion.")
     raise Exception("Timeout: Max turns reached")

@@ -32,30 +32,58 @@ You are controlling a browser on Clay.com's People Search interface. Your goal i
 
 ### Filter Application Steps
 
+#### Company Attributes Section
+1. **Expand "Company attributes" section** (click the accordion header)
+2. **Set Industries:**
+    - Click the "Industries to include" dropdown (aria-label='Industries to include')
+    - Type each industry from {{ai_industries}}
+    - Wait for suggestions to appear, then click the matching option
+    - Pill appears when selected
+3. **IMPORTANT:** Press ESC after each dropdown/input to close it before moving to the next
+
+#### Job Title Section
 1. **Expand "Job title" section** (click the accordion header)
-2. **Set Seniority:** Click the Seniority dropdown, select from {{ai_seniority}}
-3. **Set Job Titles:** Click the "Job title (is similar to)" input, type each title from {{ai_titles}}, press Enter after each
-4. **Set Exclusions:** Click "Job titles to exclude", type each from {{ai_excludeKeywords}}
-5. **IMPORTANT:** Press ESC after each dropdown/input to close it before moving to the next
+2. **Set Seniority:** Click the Seniority dropdown (aria-label='Seniority'), select from {{ai_seniority}}
+3. **Set Job Titles (MULTI-SELECT - CRITICAL):**
+    - For EACH title in {{ai_titles}}, use `type_and_enter` **WITHOUT placeholder** (relies on previous focus):
+      `{"type": "type_and_enter", "value": "VP of Sales", "reason": "Add title as pill"}`
+      `{"type": "type_and_enter", "value": "Chief Revenue Officer", "reason": "Add title as pill"}`
+      ... (repeat for each title)
+    - ⚠️ **IMPORTANT:** Do NOT provide `placeholder` here, or it will fail due to duplicate elements. Only provide `value`.
+4. **Set Exclusions (also multi-select):**
+    - For each keyword in {{ai_excludeKeywords}}, use:
+      `{"type": "type_and_enter", "placeholder": "Job titles to exclude", "value": "KEYWORD", "reason": "Add exclusion as pill"}`
+5. **IMPORTANT:** Press ESC after completing all entries to close the dropdown before moving to the next section
+6. **CRITICAL:** If `fill` fails with "matched multiple elements", DO NOT just press Enter. You MUST select a different element ID or use `find` command.
 
 ### Location Filter
 
-1. **Expand "Location" section**
-2. **Set Cities:** Click "Cities to include", type each location from {{ai_locations}}
-3. **Press ESC** to close the dropdown
+1. **IMPORTANT:** You may need to scroll DOWN in the left filter panel to see the Location section.
+2. **Expand "Location" section**
+3. **Scroll again** if needed to see "Cities to include" field after expanding.
+4. **Set Cities:** Click "Cities to include" dropdown (aria-label='Cities to include'), type each location from {{ai_locations}}
+5. Wait for autocomplete suggestions, click the matching city option
+6. **Press ESC** to close the dropdown
 
 ### Import Profiles
 
 1. **Check preview panel** for result count
-2. **Set Limit:** Expand "Limit results" section, set limit to 100
+2. **Set Limit (REQUIRES SCROLLING):**
+    - **Scroll down** in the left filter panel (large scroll like 1000px) to find "Limit results" section at the very bottom.
+    - Expand "Limit results" section if collapsed
+    - Click the "Limit" input field (placeholder='e.g. 10', default value is **20**)
+    - **Clear existing value:** Press `Ctrl+A` (or `Cmd+A` on Mac) to select all, then `Backspace` to delete
+    - Type "100"
+    - Press Enter to confirm
 3. **Click "Add to table"** button
-4. **Handle confirmation modal:** Click the confirm button
+    - Action: `{"type": "click", "element_id": "Add to table"}` (or find button with text "Add to table")
+4. **Handle confirmation modal:** Click the confirm button if it appears
 5. **Wait for import notification**
 
-## Completion Signals
+### Resilience & Error Handling
 
-- Return `{"type": "done", "reason": "Profiles imported successfully"}` when import is confirmed
-- Return `{"type": "fail", "reason": "..."}` if:
-  - Zero results after applying filters
-  - Cannot find expected UI elements
-  - Import fails
+1. **Ambiguous Selectors:** If you receive an error like "matched X elements", do not just repeat the same command. Instead:
+   - Perform a `snapshot` to get updated refs.
+   - Look for a different element that might be more specific.
+   - Or try to click a parent/related element first to clarify the UI state.
+2. **Missing Elements:** If an element from the directive is missing, try expanding sections or scrolling before failing.

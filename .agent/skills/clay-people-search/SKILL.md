@@ -95,12 +95,13 @@ Before applying new filters, check if any sections show active filters and clear
 To set industries:
 
 1. Find and click "Company attributes" section header to expand
-2. Locate "Industries to include" dropdown
+2. Locate "Industries to include" dropdown (aria-label='Industries to include')
 3. Click the dropdown to open
 4. For each industry value from `TargetIndustries`:
-   - Type the industry name in the search box
-   - Wait for dropdown options to filter
-   - Click the matching option to add as pill
+   - Type the industry name in the search box (e.g., "Technology")
+   - Wait for dropdown options to filter (suggestions appear below)
+   - Click the matching option to add as pill (e.g., "Information Technology and Services")
+   - Pill appears in the input field and header shows "1 filter"
 5. **CRITICAL:** Press `ESC` to close the dropdown before moving to the next section
    - Clay dropdowns stay open after selection; pressing ESC ensures clean state
 
@@ -131,14 +132,17 @@ To set seniority, titles, and exclusions:
 
 To set target cities:
 
-1. Find and click "Location" section header to expand
-2. Locate "Cities to include" dropdown
-3. Click to open the dropdown
-4. For each city from `TargetGeos`:
-   - Type the city name
-   - Wait for autocomplete suggestions
-   - Click the matching city option
-5. **CRITICAL:** Press `ESC` to close the dropdown before proceeding
+1. **IMPORTANT:** You may need to scroll DOWN in the filter panel to see the "Location" section when other sections are expanded.
+2. Find and click "Location" section header to expand
+3. **Scroll again** if needed to see "Cities to include" field (it may be below the viewport after expanding)
+4. Locate "Cities to include" dropdown (aria-label='Cities to include')
+5. Click to open the dropdown
+6. For each city from `TargetGeos`:
+   - Type the city name (e.g., "New York")
+   - Wait for autocomplete suggestions to appear
+   - Click the matching city option (e.g., "New York City")
+   - Pill appears in the input field
+7. **CRITICAL:** Press `ESC` to close the dropdown before proceeding
    - Do NOT rely on "click outside" — always use ESC for consistent behavior
 
 ### Stage 6: Verify and Execute Search
@@ -146,14 +150,19 @@ To set target cities:
 1. Check preview panel for result count
 2. Verify reasonable number of results (not 0, not millions unfiltered)
 3. **Set Result Limits:**
-   - Locate and expand the **"Limit results"** section (usually at the bottom of the left panel).
-   - Find the **"Limit"** input field and set it to `100`.
+   - **IMPORTANT:** The "Limit results" section is **always at the bottom** of the left filter panel. When filter sections are expanded, it will be off-screen.
+   - **Scroll down** within the filter panel (use large scroll like Dy=1000) to find and expand the **"Limit results"** section.
+   - Find the **"Limit"** input field (placeholder='e.g. 10'). It has a default value of **20**.
+   - Click the input to focus it
+   - **Clear existing value:** Press `Ctrl+A` (or `Cmd+A` on Mac) to select all, then `Backspace` to delete
+   - Type the desired limit (e.g., `100`)
+   - Press `Enter` to confirm the value
    - Ensure the **"Limit per company"** field is **blank/empty**.
-4. Click "Add to table" button
-5. **CRITICAL:** A confirmation modal will appear. **Do NOT navigate back** or click away.
-6. Wait for the confirmation modal to be visible.
-7. Click the primary confirmation button inside the modal (labeled "Add [N] people" or "Add to table").
-8. Wait for the import started notification/toast.
+4. **Click "Add to table" button** (the main button, NOT the dropdown arrow next to it)
+   - For a new search, only "Add to table" appears (no "Continue" option)
+   - Clicking the button will immediately add the number of profiles specified in "Limit Results"
+   - The profiles will be imported to the Clay table
+5. Wait for import confirmation (toast notification or redirect to table view)
 
 ## Element Reference Patterns
 

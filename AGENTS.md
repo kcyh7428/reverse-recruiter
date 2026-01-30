@@ -187,6 +187,7 @@ curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/jso
 | Problem | Root Cause | Fix |
 |---------|-----------|-----|
 | Infinite "Enter" loop during login | AI waits only 1-2s, page not ready | Use deterministic `perform_login()` with 15/10/25s waits |
+| `os error 11` (Resource temporarily unavailable) | PID/Memory exhaustion during `fork()` | Increase Memory to `8Gi`. Do not optimize down to 4GB. |
 | Logs show old code after deploy | Image caching or wrong context | Always run from `execution/` dir, check rev name |
 | "Welcome back" persists after login | Password field not found due to short wait | Increase wait to 10s after email submission |
 | Cloud Build uses "global" | This is fine. Cloud Build location doesn't affect Cloud Run region. |

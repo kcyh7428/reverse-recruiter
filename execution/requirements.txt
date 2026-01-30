@@ -1,6 +1,6 @@
 flask>=3.0.0
 gunicorn>=21.2.0
-google-cloud-aiplatform>=1.38.0
+openai>=1.40.0
 pyairtable>=2.2.0
 python-dotenv>=1.0.0
 # Pydantic is often pulled in by other libs, but explicit is better

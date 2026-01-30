@@ -2,9 +2,14 @@ import os
 from dotenv import load_dotenv
 load_dotenv() # Load .env BEFORE other imports
 
+import logging
 from flask import Flask, jsonify, request
 from airtable_client import get_pending_jobseekers, update_jobseeker_status
 from agent_orchestrator import run_automation_for_jobseeker, test_connectivity, test_clay_access, test_clay_auth
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
@@ -34,25 +39,47 @@ def health_check():
 def trigger_automation():
     """
     Triggered by Cloud Scheduler or manual POST.
-    Fetches pending records and runs the agent loop for each.
+    Fetches pending records or a specific record_id and runs the agent loop.
     """
-    # Optional: Basic auth or header check here if needed
+    record_id = request.args.get("record_id")
     
-    jobseekers = get_pending_jobseekers()
+    if record_id:
+        logger.info(f"Targeted automation triggered for record: {record_id}")
+        # Fetch single record from Airtable
+        from airtable_client import get_airtable_table
+        try:
+            table = get_airtable_table()
+            r = table.get(record_id)
+            fields = r.get("fields", {})
+            jobseekers = [{
+                "id": r["id"],
+                "name": fields.get("Name", "Unknown"),
+                "targetTitles": fields.get("TargetTitles", ""),
+                "targetGeos": fields.get("TargetGeos", ""),
+                "seniority": fields.get("Seniority", ""),
+                "excludeKeywords": fields.get("ExcludeKeywords", ""),
+                "targetIndustries": fields.get("TargetIndustries", ""),
+                "includeKeywords": fields.get("IncludeKeywords", ""),
+                "notesForCoach": fields.get("NotesForCoach", "")
+            }]
+        except Exception as e:
+            logger.error(f"Failed to fetch record {record_id}: {e}")
+            return jsonify({"error": f"Record {record_id} not found"}), 404
+    else:
+        logger.info("Batch automation triggered for all pending records.")
+        jobseekers = get_pending_jobseekers()
     
     if not jobseekers:
-        return jsonify({"message": "No pending job seekers found."}), 200
+        return jsonify({"message": "No job seekers found to process."}), 200
     
     results = []
     for js in jobseekers:
         js_id = js["id"]
         try:
-            # Removed "Processing" update to avoid Airtable schema errors
             run_automation_for_jobseeker(js)
             update_jobseeker_status(js_id, "✅ Ready to Launch")
             results.append({"id": js_id, "status": "success"})
         except Exception as e:
-            # Just log the error, don't try to update Status to "Error" (doesn't exist)
             print(f"Error processing {js_id}: {e}")
             results.append({"id": js_id, "status": "error", "error": str(e)})
             

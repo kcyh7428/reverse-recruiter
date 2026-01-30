@@ -40,7 +40,8 @@ This phase validated that the agent can bypass bot detection and maintain sessio
 |------|------------|
 | GCP IP blocked by Clay | May need a residential proxy service (e.g., Bright Data, Oxylabs) |
 | "Verify your email" on first login | User clicks email link once; subsequent logins should be smooth |
-| Memory exhaustion | Scale Cloud Run to 4GB RAM, 2 vCPU |
+| "Verify your email" on first login | User clicks email link once; subsequent logins should be smooth |
+| Memory exhaustion (`os error 11`) | Scale Cloud Run to 8GB RAM (verified requirement) |
 
 ---
 
@@ -50,10 +51,17 @@ This phase validated that the agent can bypass bot detection and maintain sessio
 > [!NOTE]
 > This phase should only begin **after** Phase 2 confirms stable production auth.
 
-- [ ] **Filter Automation**: Automate job title, location, and seniority filter clicks.
-- [ ] **Import Trigger**: Automate the "Add to table" button click.
-- [ ] **Error Handling**: Build resiliency for zero results or limit hit.
-- [ ] **Verification**: Successful import of 1 real profile into the Clay workbook.
+- [x] **Filter Automation (Infrastructure)**: Verified browser agent runs 20+ turns without crashing (Cloud Run 8GB).
+- [ ] **Filter Automation (Logic)**: Fix `Selector matched multiple elements` error for Job Title dropdown.
+
+---
+
+## 🧠 Phase 4: Agent Logic Refinement (CURRENT)
+**Goal:** Tuning the AI's interaction logic to handle Clay's complex UI (ambiguous selectors, multi-select dropdowns).
+
+- [ ] **Job Title Selector**: Investigate why `@e21` matches multiple elements.
+- [ ] **Retry Logic**: Ensure agent re-snapshots or uses more specific selectors on "matched multiple" error.
+- [ ] **Full Loop**: Verify import trigger after filters are applied.
 
 ---
 

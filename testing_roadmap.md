@@ -4,7 +4,7 @@ This document outlines the current progress, completed milestones, and the remai
 
 > [!IMPORTANT]
 > **Strategy: Validate Production Early!**
-> We deploy to Cloud Run with a minimal test (`/test-clay-auth`) *before* building full automation logic. This prevents wasting time on local-only features that might break in production.
+> We deploy to the VPS with a minimal test (`/test-clay-auth`) *before* building full automation logic. This prevents wasting time on local-only features that might break in production.
 
 ---
 
@@ -19,29 +19,28 @@ This document outlines the current progress, completed milestones, and the remai
 ---
 
 ## 🚀 Phase 2: Production Validation (COMPLETED ✅)
-**Goal:** Deploy the **existing Docker image** to Cloud Run and validate that authentication works from Google's infrastructure.
+**Goal:** Deploy the **existing Docker image** to the VPS and validate that authentication works from production infrastructure.
 
-This phase validated that the agent can bypass bot detection and maintain session persistence (or self-heal login) from GCP.
+This phase validated that the agent can bypass bot detection and maintain session persistence (or self-heal login) from the VPS.
 
 ### Checklist
-- [x] **Secret Manager Setup**: Migrated `CLAY_EMAIL`, `CLAY_PASSWORD`, `AIRTABLE_API_KEY` to GCP Secret Manager.
-- [x] **Cloud Run Deployment**: Deployed the current `execution/` Docker image to Cloud Run.
+- [x] **Environment Setup**: Configured `CLAY_EMAIL`, `CLAY_PASSWORD`, `AIRTABLE_API_KEY`, `OPENAI_API_KEY` in `.env` on VPS.
+- [x] **VPS Deployment**: Deployed the current `execution/` Docker image to Hostinger VPS.
 - [x] **Endpoint Test**: Hit `/test-clay-auth` and verified `logged_in: true`.
-- [x] **IP/Bot Detection Check**: Confirmed Stealth Mode still works from GCP's IP ranges (`webdriver: false`).
-- [x] **Resource Tuning**: Increased memory to 4GB and 2 vCPU for stable rendering.
+- [x] **IP/Bot Detection Check**: Confirmed Stealth Mode still works from VPS IP (`webdriver: false`).
+- [x] **Resource Tuning**: Configured container with `--memory=8g --shm-size=2gb` for stable rendering.
 
 ### Lessons Learned
 - **Auth Self-Healing**: Automated login handles expired cookies reliably.
-- **Domain Restrictions**: Public access (`allUsers`) is restricted; verification requires ID tokens.
-- **Memory**: 4GB RAM is the minimum safe threshold for complex Playwright snapshots on Cloud Run.
+- **Direct Access**: No authentication tokens required; VPS serves HTTP directly.
+- **Memory**: 8GB container memory with 2GB shm-size is the stable configuration for Playwright snapshots on VPS.
 
 ### Known Risks
 | Risk | Mitigation |
 |------|------------|
-| GCP IP blocked by Clay | May need a residential proxy service (e.g., Bright Data, Oxylabs) |
+| VPS IP blocked by Clay | May need a residential proxy service (e.g., Bright Data, Oxylabs) |
 | "Verify your email" on first login | User clicks email link once; subsequent logins should be smooth |
-| "Verify your email" on first login | User clicks email link once; subsequent logins should be smooth |
-| Memory exhaustion (`os error 11`) | Scale Cloud Run to 8GB RAM (verified requirement) |
+| Memory exhaustion (`os error 11`) | Ensure `--shm-size=2gb` and `--memory=8g` on `docker run` |
 
 ---
 
@@ -51,7 +50,7 @@ This phase validated that the agent can bypass bot detection and maintain sessio
 > [!NOTE]
 > This phase should only begin **after** Phase 2 confirms stable production auth.
 
-- [x] **Filter Automation (Infrastructure)**: Verified browser agent runs 20+ turns without crashing (Cloud Run 8GB).
+- [x] **Filter Automation (Infrastructure)**: Verified browser agent runs 20+ turns without crashing (VPS with 8GB container + 2GB shm).
 - [ ] **Filter Automation (Logic)**: Fix `Selector matched multiple elements` error for Job Title dropdown.
 
 ---
@@ -67,12 +66,13 @@ This phase validated that the agent can bypass bot detection and maintain sessio
 
 ## � Environment Comparison
 
-| Aspect | Local (`local_test.sh`) | Cloud Run |
-|--------|-------------------------|-----------|
+| Aspect | Local (`local_test.sh`) | VPS (Hostinger) |
+|--------|-------------------------|-----------------|
 | **Runtime** | Docker container | Docker container (same image) |
 | **Browser** | `agent-browser` (Playwright) | `agent-browser` (Playwright) |
-| **Stealth Mode** | ✅ Enabled | ✅ Enabled (same flags) |
-| **Network/IP** | Residential | Google Data Center ⚠️ |
-| **Credentials** | `.env` / ADC JSON | Secret Manager / Workload Identity |
+| **Stealth Mode** | Enabled | Enabled (same flags) |
+| **Network/IP** | Residential | Hostinger Data Center (72.62.253.226) |
+| **Credentials** | `.env` file | `.env` file (same format) |
+| **AI Provider** | OpenAI API | OpenAI API (same) |
 
-The environments are **highly similar** now because we're running in Docker locally. The main variable is the **network/IP** origin.
+The environments are **highly similar** because both run the same Docker image. The main variable is the **network/IP** origin.

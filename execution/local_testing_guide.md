@@ -1,6 +1,6 @@
 # Local Testing Guide for Clay Automation
 
-This guide explains how to run the browser automation agent locally using Docker. This setup mimics the production Cloud Run environment.
+This guide explains how to run the browser automation agent locally using Docker. This setup mimics the production VPS environment.
 
 ## Prerequisites
 
@@ -42,17 +42,14 @@ This guide explains how to run the browser automation agent locally using Docker
 
 ## Troubleshooting & Knowledge Base
 
-### 1. Google Cloud Authentication ("Default credentials not found")
-The agent needs to talk to Vertex AI (Gemini). It uses your local machine's credentials.
+### 1. OpenAI API Key
+The agent uses OpenAI GPT-4o for its decision loop. The `OPENAI_API_KEY` environment variable must be set.
 **Fix:**
-```bash
-# Mobile/verify installation
-/opt/homebrew/bin/gcloud --version
-
-# Log in (opens browser)
-/opt/homebrew/bin/gcloud auth application-default login
+Ensure your `.env` file (in the project root or `execution/` directory) contains a valid OpenAI API key:
 ```
-*Note: This creates `~/.config/gcloud/application_default_credentials.json` which `local_test.sh` mounts into the container.*
+OPENAI_API_KEY=sk-...
+```
+The `local_test.sh` script loads this automatically from `.env` and passes it into the Docker container. If the key is missing or invalid, the agent will fail to make AI decisions during automation.
 
 ### 2. Browser "Executable doesn't exist" (Playwright Version Mismatch)
 **Symptoms:** Error logs showing `browserType.launch: Executable doesn't exist` and a message about Playwright v1.58+.

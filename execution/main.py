@@ -38,7 +38,7 @@ def health_check():
 @app.route("/run-automation", methods=["POST"])
 def trigger_automation():
     """
-    Triggered by Cloud Scheduler or manual POST.
+    Triggered by manual POST or scheduled task.
     Fetches pending records or a specific record_id and runs the agent loop.
     """
     record_id = request.args.get("record_id")
@@ -80,7 +80,8 @@ def trigger_automation():
             update_jobseeker_status(js_id, "✅ Ready to Launch")
             results.append({"id": js_id, "status": "success"})
         except Exception as e:
-            print(f"Error processing {js_id}: {e}")
+            logger.error(f"Error processing {js_id}: {e}")
+            update_jobseeker_status(js_id, "Error - Automation Failed", error_message=str(e))
             results.append({"id": js_id, "status": "error", "error": str(e)})
             
     return jsonify({"processed": len(results), "details": results}), 200

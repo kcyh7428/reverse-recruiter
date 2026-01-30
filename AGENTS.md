@@ -1,6 +1,6 @@
 # Agent Instructions
 
-> This file is mirrored across CLAUDE.md, AGENTS.md, and GEMINI.md so the same instructions load in any AI environment.
+> This file is mirrored across CLAUDE.md and AGENTS.md so the same instructions load in any AI environment.
 
 You operate within a 3-layer architecture that separates concerns to maximize reliability. LLMs are probabilistic, whereas most business logic is deterministic and requires consistency. This system fixes that mismatch.
 
@@ -90,36 +90,58 @@ For complex, multi-step browser automation (like Clay interactions), use **Skill
 
 ---
 
-## Cloud Deployment Procedures (GCP)
+## VPS Deployment Procedures
 
 > [!IMPORTANT]
 > **NEVER DEVIATE from these procedures without explicit user approval.** A new agent picking up this project should follow these steps exactly.
 
-### 1. Cloud Build & Cloud Run Workflow
+### 1. VPS Access & Deploy Workflow
 
-The `execution/` directory is the Docker build context. All builds and deployments use these exact commands:
+**Infrastructure:** Hostinger VPS (KVM4, 16GB RAM, Ubuntu 24.04, Docker)
 
 ```bash
-# Step 1: Build Docker image via Cloud Build (Global by default is OK)
-cd execution
-gcloud builds submit --tag us-central1-docker.pkg.dev/reverse-recruiter-prod/clay-automation/clay-browser-automation .
+# SSH into the VPS
+ssh root@72.62.253.226
 
-# Step 2: Deploy to Cloud Run
-gcloud run deploy clay-browser-automation \
-    --image us-central1-docker.pkg.dev/reverse-recruiter-prod/clay-automation/clay-browser-automation:latest \
-    --region us-central1
+# Automated deploy (from local machine -- builds, pushes, and restarts on VPS)
+./execution/deploy_vps.sh 72.62.253.226
+
+# Manual deploy (on the VPS)
+cd /root/reverse-recruiter
+git pull origin main
+cd execution
+docker build -t clay-automation .
+docker stop clay-auto && docker rm clay-auto
+docker run -d --name clay-auto --restart=always \
+  --memory=8g --shm-size=2gb \
+  -p 8080:8080 \
+  --env-file /root/reverse-recruiter/.env \
+  clay-automation
 ```
 
 **Key Infrastructure:**
 | Component | Value |
 |-----------|-------|
-| GCP Project | `reverse-recruiter-prod` |
-| Artifact Registry | `us-central1-docker.pkg.dev/reverse-recruiter-prod/clay-automation` |
-| Cloud Run Service | `clay-browser-automation` |
-| Region | `us-central1` |
-| Memory | `4Gi` |
-| CPU | `2` vCPU |
-| Auth | `--no-allow-unauthenticated` (requires ID token) |
+| VPS Provider | Hostinger (KVM4) |
+| IP Address | `72.62.253.226` |
+| OS | Ubuntu 24.04 |
+| RAM | 16 GB |
+| Container Name | `clay-auto` |
+| Port | `8080` |
+| Auth | None required (direct HTTP) |
+
+**Docker Management Commands:**
+```bash
+# View logs
+docker logs clay-auto --tail 50
+docker logs clay-auto -f              # Follow live
+
+# Restart container
+docker restart clay-auto
+
+# Stop and remove
+docker stop clay-auto && docker rm clay-auto
+```
 
 ### 2. Critical: Deterministic Login Pattern
 
@@ -167,19 +189,20 @@ def perform_login() -> bool:
 ### 3. Testing Endpoints
 
 ```bash
-# Get auth token for Cloud Run
-TOKEN=$(gcloud auth print-identity-token)
+# Health check
+curl http://72.62.253.226:8080/
 
-# Health check (should return build_version if set)
-curl -H "Authorization: Bearer $TOKEN" https://clay-browser-automation-702709903794.us-central1.run.app/
+# Test browser connectivity
+curl http://72.62.253.226:8080/test-connectivity
 
-# Test authentication flow
-curl -H "Authorization: Bearer $TOKEN" https://clay-browser-automation-702709903794.us-central1.run.app/test-clay-auth
+# Test Clay access
+curl http://72.62.253.226:8080/test-clay-access
+
+# Test full authentication flow
+curl http://72.62.253.226:8080/test-clay-auth
 
 # Trigger full automation for a JobSeeker
-curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-    -d '{"jobseeker_id": "recXXX"}' \
-    https://clay-browser-automation-702709903794.us-central1.run.app/run-automation
+curl -X POST "http://72.62.253.226:8080/run-automation?record_id=recfV7X8d6XccguoL"
 ```
 
 ### 4. Common Pitfalls & Self-Annealing Lessons
@@ -187,10 +210,10 @@ curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/jso
 | Problem | Root Cause | Fix |
 |---------|-----------|-----|
 | Infinite "Enter" loop during login | AI waits only 1-2s, page not ready | Use deterministic `perform_login()` with 15/10/25s waits |
-| `os error 11` (Resource temporarily unavailable) | PID/Memory exhaustion during `fork()` | Increase Memory to `8Gi`. Do not optimize down to 4GB. |
-| Logs show old code after deploy | Image caching or wrong context | Always run from `execution/` dir, check rev name |
+| `os error 11` (Resource temporarily unavailable) | PID/Memory exhaustion during `fork()` | Ensure `--shm-size=2gb` and `--memory=8g` on `docker run` |
+| Logs show old code after deploy | Image caching or wrong context | Always rebuild with `docker build` from `execution/` dir |
 | "Welcome back" persists after login | Password field not found due to short wait | Increase wait to 10s after email submission |
-| Cloud Build uses "global" | This is fine. Cloud Build location doesn't affect Cloud Run region. |
+| Container not starting | Port conflict or stale container | `docker stop clay-auto && docker rm clay-auto` then re-run |
 
 ---
 

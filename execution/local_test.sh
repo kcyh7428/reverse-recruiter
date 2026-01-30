@@ -12,7 +12,7 @@ elif [ -f ".env" ]; then
 fi
 
 # Validate required environment variables
-if [ -z "$AIRTABLE_API_KEY" ] || [ -z "$CLAY_EMAIL" ] || [ -z "$CLAY_PASSWORD" ]; then
+if [ -z "$AIRTABLE_API_KEY" ] || [ -z "$CLAY_EMAIL" ] || [ -z "$CLAY_PASSWORD" ] || [ -z "$OPENAI_API_KEY" ]; then
     echo "❌ Error: Required environment variables not set."
     echo "   Please create a .env file with:"
     echo "   - AIRTABLE_API_KEY"
@@ -20,7 +20,7 @@ if [ -z "$AIRTABLE_API_KEY" ] || [ -z "$CLAY_EMAIL" ] || [ -z "$CLAY_PASSWORD" ]
     echo "   - AIRTABLE_TABLE_NAME"
     echo "   - CLAY_EMAIL"
     echo "   - CLAY_PASSWORD"
-    echo "   - GCP_PROJECT_ID"
+    echo "   - OPENAI_API_KEY"
     exit 1
 fi
 
@@ -29,7 +29,7 @@ ENV_VARS=(
     -e "AIRTABLE_API_KEY=${AIRTABLE_API_KEY}"
     -e "AIRTABLE_BASE_ID=${AIRTABLE_BASE_ID:-app8KvRTUVMWeloR8}"
     -e "AIRTABLE_TABLE_NAME=${AIRTABLE_TABLE_NAME:-JobSeekers}"
-    -e "GCP_PROJECT_ID=${GCP_PROJECT_ID:-reverse-recruiter-prod}"
+    -e "OPENAI_API_KEY=${OPENAI_API_KEY}"
     -e "AGENT_BROWSER_SESSION=clay_automation_session"
     -e "CLAY_EMAIL=${CLAY_EMAIL}"
     -e "CLAY_PASSWORD=${CLAY_PASSWORD}"
@@ -60,5 +60,4 @@ docker run --rm -p $PORT:$PORT \
     "${ENV_VARS[@]}" \
     -v "$(pwd)/session_cookies.json:/app/session_cookies.json" \
     -v "$(pwd)/diagnostics:/app/diagnostics" \
-    -v "$HOME/.config/gcloud/application_default_credentials.json:/root/.config/gcloud/application_default_credentials.json" \
     $IMAGE_NAME

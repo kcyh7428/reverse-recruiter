@@ -288,7 +288,7 @@ def test_clay_auth() -> Dict[str, Any]:
 
 def interpret_search_criteria(jobseeker: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Uses Gemini to intelligently interpret raw Airtable JobSeeker data
+    Uses OpenAI GPT-4o to intelligently interpret raw Airtable JobSeeker data
     and generate optimized Clay search criteria.
     
     The AI considers:
@@ -396,7 +396,7 @@ def run_automation_for_jobseeker(jobseeker: Dict[str, Any]):
     
     # Sequence: 
     logger.info(f"Preparing workspace for {jobseeker.get('id')}...")
-    # Force close any existing daemon to ensure new args (like --disable-dev-shm-usage) are strictly applied
+    # Force close any existing daemon to ensure a clean browser state
     run_agent_browser_command(["close"]) 
     time.sleep(5) # Increase wait for cleanup
     
@@ -415,7 +415,7 @@ def run_automation_for_jobseeker(jobseeker: Dict[str, Any]):
         time.sleep(10)
     
     # 2. AI Interpretation of Search Criteria (Phase 3 addition)
-    logger.info("Interpreting search criteria via Gemini AI...")
+    logger.info("Interpreting search criteria via OpenAI GPT-4o...")
     search_criteria = interpret_search_criteria(jobseeker)
     logger.info(f"AI-interpreted search criteria: {json.dumps(search_criteria, indent=2)}")
     

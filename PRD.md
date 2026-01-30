@@ -14,7 +14,7 @@ When implementing this PRD, the agent **must** review and align with these refer
 |-----------|----------|---------|
 | Vercel Agent Browser CLI | `https://github.com/vercel-labs/agent-browser` | Install, CLI usage, commands |
 | Cole Medin's Video | `https://www.youtube.com/watch?v=7aEQnTsI6zs` (5:05–10:30) | Workflow + Skill wiring |
-| Local Testing Guide | `execution/local_testing_guide.md` | Docker + Agent Browser + Vertex AI setup |
+| Local Testing Guide | `execution/local_testing_guide.md` | Docker + Agent Browser + OpenAI setup |
 | Agent Browser Skill | `skills/agent-browser/SKILL.md` (to be created) | CLI command reference for the agent |
 
 > [!IMPORTANT]
@@ -27,14 +27,14 @@ When implementing this PRD, the agent **must** review and align with these refer
 Build a **cloud-hosted AI agent** that:
 
 1. Reads **job seeker** records from Airtable where status = `profile sourcing`.
-2. Uses **Gemini 2.5** to generate a structured "search profile" from each job seeker's data.
+2. Uses **OpenAI GPT-4o** to generate a structured "search profile" from each job seeker's data.
 3. Uses **Vercel Agent Browser CLI** (Cole-style Skill approach) to drive Clay's web UI like a human.
 4. Uses Clay's pre-configured table "send" destinations to deliver profiles to downstream systems.
 5. Clears processed rows from the Clay table after sending.
 6. Updates the job seeker's Airtable record to reflect completion and result status.
 
 > [!NOTE]
-> No n8n or external orchestrator is involved. The application is self-contained and runs on Google Cloud using Vertex AI Gemini 2.5 and Vercel Agent Browser inside Docker.
+> No n8n or external orchestrator is involved. The application is self-contained and runs on a Hostinger VPS using OpenAI GPT-4o and Vercel Agent Browser inside Docker.
 
 ---
 
@@ -59,7 +59,7 @@ Build a **cloud-hosted AI agent** that:
 
 ```
 ┌─────────────────┐     ┌──────────────────────┐     ┌─────────────────┐
-│   Airtable      │     │  Cloud Run           │     │    Clay.com     │
+│   Airtable      │     │  Hostinger VPS       │     │    Clay.com     │
 │   JobSeekers    │────▶│  Docker Container    │────▶│  People Search  │
 │   Table         │     │  (Python + Agent     │     │  Interface      │
 │                 │◀────│   Browser CLI)       │◀────│                 │
@@ -67,17 +67,17 @@ Build a **cloud-hosted AI agent** that:
                                │
                                ▼
                         ┌──────────────────┐
-                        │  Vertex AI       │
-                        │  Gemini 2.5      │
+                        │  OpenAI API      │
+                        │  GPT-4o          │
                         └──────────────────┘
 ```
 
 ### 3.2 Runtime Environment
 
-- **Runtime**: Google Cloud Run (or equivalent container hosting).
+- **Runtime**: Hostinger VPS (Docker on bare metal Ubuntu 24.04).
 - **Container**: Single Docker image containing:
   - Application code (Python).
-  - Vertex AI Gemini 2.5 client.
+  - OpenAI GPT-4o client.
   - **Vercel Agent Browser CLI** installed globally.
   - System packages required by Playwright/Agent Browser.
 
@@ -134,12 +134,12 @@ Core workflow:
 | FR-2 | Read at least: Record ID, Name, Role/Title, Skills/keywords, Location preference, Notes/description. |
 | FR-3 | Field names must be configurable via environment variables or config file. |
 
-### 4.2 Candidate Understanding (Gemini 2.5)
+### 4.2 Candidate Understanding (OpenAI GPT-4o)
 
 | ID | Requirement |
 |----|-------------|
-| FR-4 | For each job seeker, call Gemini 2.5 to generate a **structured search profile** JSON containing: target role titles, seniority range, locations/regions, primary skills/keywords, excluded roles/industries. |
-| FR-5 | The Gemini prompt must output **strict JSON** for easy parsing (no free-form prose). |
+| FR-4 | For each job seeker, call OpenAI GPT-4o to generate a **structured search profile** JSON containing: target role titles, seniority range, locations/regions, primary skills/keywords, excluded roles/industries. |
+| FR-5 | The GPT-4o prompt must output **strict JSON** for easy parsing (no free-form prose). |
 
 **Example Search Profile JSON:**
 ```json
@@ -162,7 +162,7 @@ Core workflow:
 |----|-------------|
 | FR-6 | Use Agent Browser CLI to log in to `https://app.clay.com` and navigate to the configured Clay table. |
 | FR-6a | **Stealth Mode**: Always use stealth flags (`--disable-blink-features=AutomationControlled`) and realistic User-Agents to bypass Clay's bot detection. |
-| FR-7 | Use `agent-browser fill` and related commands to populate search/filter UI with the Gemini-derived search profile. |
+| FR-7 | Use `agent-browser fill` and related commands to populate search/filter UI with the GPT-4o-derived search profile. |
 | FR-8 | Select rows representing suitable profiles and activate Clay's **"send" / destination** functionality via the UI. |
 | FR-9 | Use `snapshot -i` and/or additional reads to verify send completion (UI confirmation or status column update). |
 | FR-10 | After successful send, **clear/delete** processed rows from the Clay table using Agent Browser commands. |
@@ -203,7 +203,7 @@ agent-browser click @e35           # Delete button
 | ID | Requirement |
 |----|-------------|
 | FR-13 | Support a **batch size** limit (max N job seekers per run). |
-| FR-14 | Support two modes: **Manual** (run once on command) and **Scheduled** (invoked by Cloud Scheduler). |
+| FR-14 | Support two modes: **Manual** (run once on command) and **Scheduled** (invoked by cron or external trigger). |
 
 ---
 
@@ -211,8 +211,8 @@ agent-browser click @e35           # Delete button
 
 | ID | Requirement |
 |----|-------------|
-| NFR-1 | Must run inside a single Docker container on Google Cloud. |
-| NFR-2 | All secrets (Airtable API keys, Clay credentials, Vertex AI keys) must be in environment variables or secrets manager. |
+| NFR-1 | Must run inside a single Docker container on the Hostinger VPS. |
+| NFR-2 | All secrets (Airtable API keys, Clay credentials, OpenAI API key) must be in environment variables (`.env` file). |
 | NFR-3 | Basic logging: start/end of each run, per-job-seeker success/failure and key metrics. |
 | NFR-4 | Per job seeker timeout (5-10 minutes); on timeout, mark as error and proceed. |
 
@@ -233,14 +233,14 @@ agent-browser click @e35           # Delete button
 sequenceDiagram
     participant App
     participant Airtable
-    participant Gemini
+    participant GPT4o as GPT-4o
     participant AgentBrowser
     participant Clay
 
     App->>Airtable: Query status = "profile sourcing"
     Airtable-->>App: Job seeker record
-    App->>Gemini: Generate search profile JSON
-    Gemini-->>App: {targetTitles, locations, ...}
+    App->>GPT4o: Generate search profile JSON
+    GPT4o-->>App: {targetTitles, locations, ...}
     App->>AgentBrowser: open clay.com
     AgentBrowser->>Clay: Navigate to table
     App->>AgentBrowser: snapshot -i --json
@@ -263,7 +263,7 @@ sequenceDiagram
 
 1. **Read local docs first:**
    - `UpdatedPRD.md` (this file)
-   - `execution/local_testing_guide.md` (Docker, Vertex AI auth, Agent Browser install)
+   - `execution/local_testing_guide.md` (Docker, OpenAI auth, Agent Browser install)
    - `skills/agent-browser/SKILL.md` (CLI command reference)
 
 2. **Read Agent Browser documentation:**
@@ -275,10 +275,10 @@ sequenceDiagram
 | Phase | Focus |
 |-------|-------|
 | Phase 1 | Airtable MCP/API integration (query and update job seeker records) |
-| Phase 2 | Gemini 2.5 integration and search-profile JSON design |
-| Phase 3 | Agent Browser integration (ensure CLI works inside Docker as shown in `local_testing_guide.md`) |
+| Phase 2 | OpenAI GPT-4o integration and search-profile JSON design |
+| Phase 3 | Agent Browser integration (ensure CLI works inside Docker) |
 | Phase 4 | Clay UI automation via Agent Browser commands (FR-6 through FR-10) |
-| Phase 5 | End-to-end loop: Airtable → Gemini → Clay → destination → Airtable |
+| Phase 5 | End-to-end loop: Airtable → GPT-4o → Clay → destination → Airtable |
 
 ### 8.3 Key Principles (Cole's Approach)
 

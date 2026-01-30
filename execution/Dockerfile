@@ -42,4 +42,4 @@ EXPOSE 8080
 
 # Use Gunicorn as the production server
 # 1 worker, 8 threads to handle concurrent requests
-CMD exec gunicorn --bind :$PORT --workers 1 --threads 8 --timeout 0 main:app
+CMD exec gunicorn --bind :$PORT --workers 1 --threads 8 --timeout 900 main:app

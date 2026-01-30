@@ -4,6 +4,8 @@ Test script for Phase 3: AI Criteria Interpretation
 
 Tests the interpret_search_criteria function with the test JobSeeker record.
 Run this from the execution/ directory or adjust paths.
+
+Requires OPENAI_API_KEY environment variable to be set.
 """
 
 import os
@@ -12,10 +14,6 @@ import json
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-# Set up environment for Vertex AI
-os.environ.setdefault("GCP_PROJECT_ID", "reverse-recruiter-prod")
-os.environ.setdefault("GCP_REGION", "us-central1")
 
 from agent_orchestrator import interpret_search_criteria
 

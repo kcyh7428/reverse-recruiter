@@ -472,7 +472,7 @@ def run_automation_for_jobseeker(jobseeker: Dict[str, Any]):
     # 3. Initialize chat history for OpenAI
     # Directive goes in system message (sent once). Snapshots go in user messages per turn.
     # Windowed: keep system message + last N turn pairs to prevent context overflow.
-    CHAT_WINDOW_SIZE = 8  # Keep last 8 turn pairs (16 user+assistant messages)
+    CHAT_WINDOW_SIZE = 5  # Keep last 5 turn pairs (10 user+assistant messages)
     system_message = {"role": "system", "content": directive_text}
     chat_messages = []
 
@@ -518,6 +518,12 @@ def run_automation_for_jobseeker(jobseeker: Dict[str, Any]):
         if snapshot_json.startswith("Error:"):
              logger.error(f"Snapshot failed: {snapshot_json}")
              raise Exception(f"Browser Snapshot Failed: {snapshot_json}")
+
+        # Truncate snapshot to prevent GPT-4o context overflow (400 BadRequest)
+        MAX_SNAPSHOT_CHARS = 6000
+        if len(snapshot_json) > MAX_SNAPSHOT_CHARS:
+            logger.info(f"Snapshot truncated: {len(snapshot_json)} -> {MAX_SNAPSHOT_CHARS} chars")
+            snapshot_json = snapshot_json[:MAX_SNAPSHOT_CHARS] + "\n... [TRUNCATED — focus on visible elements above]"
         
         # Build prompt with previous error if any
         error_context = ""
@@ -540,11 +546,9 @@ Decide the next action based on the Directive (in system message) and current pa
 Return ONLY a JSON object with one of these structures:
 {{"type": "click", "element_id": "@eX", "reason": "why"}}
 {{"type": "fill", "element_id": "@eX", "value": "text", "reason": "why"}}
-{{"type": "fill_placeholder", "placeholder": "text", "value": "text", "reason": "Use if selector is ambiguous"}}
-{{"type": "fill_label", "label": "text", "value": "text", "reason": "Use if targeting by label"}}
-{{"type": "type_and_enter", "placeholder": "text", "value": "text", "reason": "Type text and press Enter - use for multi-select pills (does NOT clear existing content)"}}
+{{"type": "type_and_enter", "placeholder": "text", "value": "text", "reason": "Type text and press Enter - use for multi-select pill inputs like job titles, exclusions, cities"}}
 {{"type": "press", "key": "Enter", "reason": "Use for Enter, Escape, or other keys"}}
-{{"type": "scroll", "direction": "down", "pixels": 500, "reason": "Scroll the filter panel to reveal hidden sections like Limit results"}}
+{{"type": "scroll", "direction": "down", "pixels": 300, "reason": "Scroll to reveal hidden sections"}}
 {{"type": "done", "reason": "why"}}
 {{"type": "fail", "reason": "why"}}
 """
@@ -569,7 +573,10 @@ Return ONLY a JSON object with one of these structures:
             raw_text = response.choices[0].message.content.strip()
             chat_messages.append({"role": "assistant", "content": raw_text})
         except Exception as e:
+            # Log detailed error info for OpenAI BadRequestError (likely context overflow)
+            total_chars = sum(len(m.get("content", "")) for m in messages_to_send)
             logger.error(f"AI decision failed after retries: {e}")
+            logger.error(f"Message stats: {len(messages_to_send)} messages, ~{total_chars} total chars, snapshot: {len(snapshot_json)} chars")
             raise
         
         # Clean up markdown code blocks if present

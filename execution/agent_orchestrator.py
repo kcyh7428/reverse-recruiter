@@ -600,8 +600,8 @@ Return ONLY a JSON object with one of these structures:
         action_type = action.get("type")
         last_error = None  # Reset error before new action
 
-        # Loop detection: track repeated actions
-        action_key = f"{action_type}:{action.get('element_id', action.get('placeholder', ''))}"
+        # Loop detection: track repeated actions (include value to avoid false positives on different pill entries)
+        action_key = f"{action_type}:{action.get('element_id', action.get('placeholder', ''))}:{action.get('value', '')}"
         if action_key == last_action_key:
             repeat_count += 1
         else:
@@ -770,26 +770,41 @@ Return ONLY a JSON object with one of these structures:
                 last_error = any_error
             
         elif action_type == "click_by_text":
-            # Click a button/link by its visible text content using JS.
-            # Useful when element ref is not visible in truncated snapshot.
+            # Click a button/link by its visible text content using JS (case-insensitive).
             btn_text = action.get("text", "")
-            safe_text = btn_text.replace('"', '\\"')
+            safe_text = btn_text.replace('"', '\\"').lower()
             click_js = f"""
-                let btns = document.querySelectorAll('button, a, [role="button"]');
+                let btns = document.querySelectorAll('button, a, [role="button"], [class*="button"]');
                 let found = null;
                 for (let b of btns) {{
-                    if (b.textContent.trim().includes('{safe_text}')) {{
+                    if (b.textContent.trim().toLowerCase().includes('{safe_text}')) {{
                         found = b;
                         break;
                     }}
                 }}
-                if (found) {{ found.click(); 'Clicked: ' + found.textContent.trim() }}
+                if (found) {{ found.scrollIntoView(); found.click(); 'Clicked: ' + found.textContent.trim() }}
                 else {{ 'Button not found: {safe_text}' }}
             """
             res = run_agent_browser_command(["eval", click_js])
             logger.info(f"click_by_text result: {res}")
             if "Button not found" in res:
-                last_error = res
+                # Auto-recovery: scroll sidebar to top and retry
+                logger.info("Button not found — scrolling sidebar to top and retrying...")
+                reset_js = """
+                    let panels = document.querySelectorAll('[class*="sidebar"], [class*="filter"], [class*="panel"], [class*="scroll"]');
+                    for (let p of panels) { p.scrollTop = 0; }
+                    window.scrollTo(0, 0);
+                    'Reset scroll'
+                """
+                run_agent_browser_command(["eval", reset_js])
+                time.sleep(1)
+                # Retry click
+                res2 = run_agent_browser_command(["eval", click_js])
+                logger.info(f"click_by_text retry result: {res2}")
+                if "Button not found" in res2:
+                    last_error = f"Button '{btn_text}' not found even after scroll reset"
+                else:
+                    time.sleep(2)
             else:
                 time.sleep(2)  # Wait for UI reaction
 

@@ -45,11 +45,13 @@ You are controlling a browser on Clay.com's People Search interface. Your goal i
 1. **Expand "Job title" section** (click the accordion header)
 2. **Set Seniority:** Click the Seniority dropdown (aria-label='Seniority'), select from {{ai_seniority}}
 3. **Set Job Titles (MULTI-SELECT - CRITICAL):**
-    - For EACH title in {{ai_titles}}, use `type_and_enter` **WITHOUT placeholder** (relies on previous focus):
-      `{"type": "type_and_enter", "value": "VP of Sales", "reason": "Add title as pill"}`
-      `{"type": "type_and_enter", "value": "Chief Revenue Officer", "reason": "Add title as pill"}`
-      ... (repeat for each title)
-    - ⚠️ **IMPORTANT:** Do NOT provide `placeholder` here, or it will fail due to duplicate elements. Only provide `value`.
+    - First, click on the job title input field to focus it (use `click` with the element_id from the snapshot)
+    - Then for EACH title in {{ai_titles}}, use `type_and_enter` with the placeholder text from the input:
+      `{"type": "type_and_enter", "placeholder": "e.g. CEO, VP, Director", "value": "VP of Sales", "reason": "Add title as pill"}`
+      `{"type": "type_and_enter", "placeholder": "e.g. CEO, VP, Director", "value": "Chief Revenue Officer", "reason": "Add title as pill"}`
+      ... (repeat for each title, one at a time)
+    - ⚠️ **CRITICAL:** Use `type_and_enter` to type titles. Do NOT use `focus_placeholder` — it only focuses without typing. You MUST use `type_and_enter` which types the text AND presses Enter to create the pill.
+    - After entering all titles, press Escape to close any dropdown.
 4. **Set Exclusions (also multi-select):**
     - For each keyword in {{ai_excludeKeywords}}, use:
       `{"type": "type_and_enter", "placeholder": "Job titles to exclude", "value": "KEYWORD", "reason": "Add exclusion as pill"}`

@@ -444,11 +444,15 @@ def run_automation_for_jobseeker(jobseeker: Dict[str, Any]):
     directive_text = load_directive(directive_path, jobseeker_with_criteria)
     
     # 3. Initialize chat history for OpenAI
+    # Windowed: keep only last N turns to prevent context overflow (BadRequestError)
+    CHAT_WINDOW_SIZE = 10  # Keep last 10 turn pairs (20 messages)
     chat_messages = []
 
     # 4. Loop
     turn = 0
     last_error = None
+    last_action_key = None
+    repeat_count = 0
     while turn < MAX_TURNS:
         turn += 1
         log_resource_diagnostics(turn)
@@ -486,12 +490,18 @@ def run_automation_for_jobseeker(jobseeker: Dict[str, Any]):
         if last_error:
             error_context = f"\n⚠️ PREVIOUS ACTION FAILED with error:\n{last_error}\nPlease try a different approach (e.g., use a more specific element ID, or a different strategy).\n"
 
+        # Loop detection: if same action repeated 3+ times, inject hint
+        loop_hint = ""
+        if repeat_count >= 3:
+            loop_hint = f"\n🔁 LOOP DETECTED: You have repeated the same action ({last_action_key}) {repeat_count} times. You MUST choose a DIFFERENT action type. If you were using focus_placeholder, switch to type_and_enter with the value you want to type. Do NOT repeat the same action.\n"
+            logger.warning(f"Loop detected: {last_action_key} repeated {repeat_count} times. Injecting hint.")
+
         # Think
         prompt = f"""
 {directive_text}
 
 ---
-{error_context}
+{error_context}{loop_hint}
 CURRENT PAGE STATE (JSON Snapshot):
 {snapshot_json}
 
@@ -502,7 +512,6 @@ Return ONLY a JSON object with one of these structures:
 {{"type": "fill", "element_id": "@eX", "value": "text", "reason": "why"}}
 {{"type": "fill_placeholder", "placeholder": "text", "value": "text", "reason": "Use if selector is ambiguous"}}
 {{"type": "fill_label", "label": "text", "value": "text", "reason": "Use if targeting by label"}}
-{{"type": "focus_placeholder", "placeholder": "text", "reason": "Focus input by placeholder without typing (for multi-select prep)"}}
 {{"type": "type_and_enter", "placeholder": "text", "value": "text", "reason": "Type text and press Enter - use for multi-select pills (does NOT clear existing content)"}}
 {{"type": "press", "key": "Enter", "reason": "Use for Enter, Escape, or other keys"}}
 {{"type": "done", "reason": "why"}}
@@ -510,6 +519,14 @@ Return ONLY a JSON object with one of these structures:
 """
         try:
             chat_messages.append({"role": "user", "content": prompt})
+
+            # Chat history windowing: keep only last N turn pairs to prevent context overflow
+            max_messages = CHAT_WINDOW_SIZE * 2  # Each turn = 1 user + 1 assistant message
+            if len(chat_messages) > max_messages:
+                # Keep last N messages (trim oldest turns)
+                chat_messages = chat_messages[-max_messages:]
+                logger.info(f"Chat history trimmed to last {CHAT_WINDOW_SIZE} turns ({len(chat_messages)} messages)")
+
             response = call_with_retry(
                 openai_client.chat.completions.create,
                 model="gpt-4o",
@@ -540,6 +557,14 @@ Return ONLY a JSON object with one of these structures:
         # Act
         action_type = action.get("type")
         last_error = None  # Reset error before new action
+
+        # Loop detection: track repeated actions
+        action_key = f"{action_type}:{action.get('element_id', action.get('placeholder', ''))}"
+        if action_key == last_action_key:
+            repeat_count += 1
+        else:
+            repeat_count = 1
+            last_action_key = action_key
 
         if action_type == "snapshot":
              logger.info("Agent requested explicit snapshot.")

@@ -53,18 +53,20 @@ def get_pending_jobseekers() -> List[Dict]:
 def update_jobseeker_status(record_id: str, status: str, error_message: Optional[str] = None):
     """
     Updates the status of a specific record.
-    If error_message is provided, it can be logged to a Notes field if exists.
+    If error_message is provided, it is logged to stdout.
+    Falls back to logging-only if the status value is not a valid Airtable select option.
     """
     try:
         table = get_airtable_table()
         fields = {"Status": status}
         if error_message:
-            # Assuming there is a 'Log' or 'Notes' field. If not, this might fail or be ignored.
-            # Ideally, we should check schema or just log to stdout.
-            # fields["AutomationLog"] = error_message 
             logger.error(f"Error for {record_id}: {error_message}")
-        
+
         table.update(record_id, fields)
         logger.info(f"Updated record {record_id} to status: {status}")
     except Exception as e:
-        logger.error(f"Failed to update record {record_id}: {e}")
+        error_str = str(e)
+        if "INVALID_MULTIPLE_CHOICE_OPTIONS" in error_str:
+            logger.warning(f"Status '{status}' is not a valid Airtable option for {record_id}. Skipping status update. Error: {error_message}")
+        else:
+            logger.error(f"Failed to update record {record_id}: {e}")

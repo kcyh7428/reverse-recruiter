@@ -1,4 +1,5 @@
 import os
+from datetime import datetime
 from dotenv import load_dotenv
 load_dotenv() # Load .env BEFORE other imports
 
@@ -76,9 +77,30 @@ def trigger_automation():
     for js in jobseekers:
         js_id = js["id"]
         try:
-            run_automation_for_jobseeker(js)
-            update_jobseeker_status(js_id, "✅ Ready to Launch")
-            results.append({"id": js_id, "status": "success"})
+            # Capture result dict instead of boolean
+            result = run_automation_for_jobseeker(js)
+
+            # Extract profile count and timestamp
+            profiles_triggered = result.get("profiles_triggered", 0) if isinstance(result, dict) else 0
+            completed_at = datetime.now().isoformat()
+
+            # Update Airtable with status + profiles + timestamp
+            update_jobseeker_status(
+                js_id,
+                "✅ Ready to Launch",
+                profiles_sent=profiles_triggered,
+                completed_at=completed_at
+            )
+
+            results.append({
+                "id": js_id,
+                "status": "success",
+                "profiles": profiles_triggered,
+                "completed_at": completed_at
+            })
+
+            logger.info(f"[SUCCESS] {js_id} | Profiles triggered: {profiles_triggered}")
+
         except Exception as e:
             logger.error(f"Error processing {js_id}: {e}")
             update_jobseeker_status(js_id, "Error - Automation Failed", error_message=str(e))

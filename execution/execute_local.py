@@ -65,9 +65,20 @@ def main():
     print("\nStarting Automation Loop...")
     print("---------------------------------------------------")
     try:
-        run_automation_for_jobseeker(jobseeker)
+        result = run_automation_for_jobseeker(jobseeker)
         print("\n---------------------------------------------------")
         print("✅ Automation completed successfully!")
+
+        # Display enrichment results
+        if isinstance(result, dict):
+            profiles = result.get("profiles_triggered", 0)
+            enrichment_started = result.get("enrichment_started", False)
+            print(f"\n📊 Enrichment Results:")
+            print(f"   - Profiles triggered: {profiles}")
+            print(f"   - Enrichment started: {'✅ Yes' if enrichment_started else '❌ No'}")
+        else:
+            print("\n⚠️  Legacy return type (boolean) - enrichment data not available")
+
     except Exception as e:
         print("\n---------------------------------------------------")
         print(f"❌ Automation failed: {e}")

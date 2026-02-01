@@ -411,6 +411,98 @@ Return ONLY valid JSON (no markdown, no explanation):
         logger.error(f"Error interpreting criteria: {e}")
         raise
 
+def trigger_enrichment() -> Dict[str, Any]:
+    """
+    After import, clicks the 'Create Profile' play button to trigger n8n webhook enrichment.
+
+    Returns:
+        dict: {"count": int, "started": bool, "error": str (optional)}
+    """
+    logger.info("[ENRICHMENT] Starting enrichment trigger sequence...")
+
+    try:
+        # Step 1: Wait for table view to fully load
+        time.sleep(5)
+
+        # Step 2: Find and click "Create Profile" play button using JS
+        click_play_button_js = """
+        (function() {
+            // Find all column headers
+            let headers = document.querySelectorAll('th, [role="columnheader"], div[class*="header"], div[class*="Header"]');
+
+            for (let header of headers) {
+                let text = header.textContent || header.innerText || '';
+                if (text.includes('Create Profile')) {
+                    // Look for play button (▶) within or near this header
+                    let btn = header.querySelector('button, svg, [role="button"], [class*="play"], [class*="Play"]');
+                    if (!btn) {
+                        // Try parent/sibling elements
+                        btn = header.parentElement?.querySelector('button, svg, [role="button"]');
+                    }
+                    if (btn) {
+                        btn.click();
+                        return 'Clicked Create Profile play button';
+                    }
+                }
+            }
+            return 'ERROR: Create Profile play button not found';
+        })();
+        """
+
+        result = run_agent_browser_command(["eval", click_play_button_js])
+        logger.info(f"[ENRICHMENT] Play button click result: {result}")
+
+        if "ERROR" in result:
+            logger.error("[ENRICHMENT] Failed to find Create Profile play button")
+            return {"count": 0, "started": False, "error": "Play button not found"}
+
+        # Step 3: Wait for dropdown to appear
+        time.sleep(2)
+
+        # Step 4: Click "Run all X rows" option and extract count
+        click_run_all_js = """
+        (function() {
+            // Find the dropdown menu item that says "Run all X rows..."
+            let items = document.querySelectorAll('div[role="menuitem"], li, button, [class*="menu"], [class*="MenuItem"]');
+
+            for (let item of items) {
+                let text = item.textContent || item.innerText || '';
+                if (text.includes('Run all') && text.includes('rows')) {
+                    // Extract the number (e.g., "Run all 25 rows that haven't run or have errors")
+                    let match = text.match(/Run all (\\d+) row/);
+                    let count = match ? parseInt(match[1]) : 0;
+
+                    item.click();
+                    return JSON.stringify({"clicked": true, "count": count, "text": text});
+                }
+            }
+            return JSON.stringify({"clicked": false, "count": 0, "error": "Run all option not found"});
+        })();
+        """
+
+        result = run_agent_browser_command(["eval", click_run_all_js])
+        logger.info(f"[ENRICHMENT] Run all click result: {result}")
+
+        # Parse JSON result
+        try:
+            result_data = json.loads(result) if isinstance(result, str) else result
+            if result_data.get("clicked"):
+                count = result_data.get("count", 0)
+                logger.info(f"[ENRICHMENT] Successfully triggered enrichment for {count} profiles")
+                time.sleep(3)  # Wait for enrichment to start
+                return {"count": count, "started": True}
+            else:
+                error_msg = result_data.get("error", "Unknown error")
+                logger.error(f"[ENRICHMENT] Failed: {error_msg}")
+                return {"count": 0, "started": False, "error": error_msg}
+        except json.JSONDecodeError:
+            logger.error(f"[ENRICHMENT] Failed to parse result: {result}")
+            return {"count": 0, "started": False, "error": "Parse error"}
+
+    except Exception as e:
+        logger.error(f"[ENRICHMENT] Exception during enrichment trigger: {e}")
+        return {"count": 0, "started": False, "error": str(e)}
+
 def run_automation_for_jobseeker(jobseeker: Dict[str, Any]):
     """
     Main agent loop for a single job seeker.
@@ -837,9 +929,17 @@ Return ONLY a JSON object with one of these structures:
                 time.sleep(2)  # Wait for UI reaction
                 # Auto-complete: if we just clicked "Add to table", the import is triggered
                 if "add to table" in btn_text.lower():
-                    logger.info("'Add to table' clicked successfully — import triggered. Returning success.")
-                    time.sleep(3)  # Extra wait for page transition
-                    return True
+                    logger.info("'Add to table' clicked successfully — import triggered.")
+                    time.sleep(3)  # Wait for page transition to table view
+
+                    # NEW: Trigger enrichment
+                    enrichment_result = trigger_enrichment()
+
+                    return {
+                        "success": True,
+                        "profiles_triggered": enrichment_result.get("count", 0),
+                        "enrichment_started": enrichment_result.get("started", False)
+                    }
 
         elif action_type == "scroll":
             direction = action.get("direction", "down")

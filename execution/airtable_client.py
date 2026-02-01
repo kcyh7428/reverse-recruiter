@@ -50,23 +50,46 @@ def get_pending_jobseekers() -> List[Dict]:
         logger.error(f"Failed to fetch pending job seekers: {e}")
         return []
 
-def update_jobseeker_status(record_id: str, status: str, error_message: Optional[str] = None):
+def update_jobseeker_status(
+    record_id: str,
+    status: str,
+    error_message: Optional[str] = None,
+    profiles_sent: Optional[int] = None,
+    completed_at: Optional[str] = None
+):
     """
-    Updates the status of a specific record.
-    If error_message is provided, it is logged to stdout.
-    Falls back to logging-only if the status value is not a valid Airtable select option.
+    Updates the status of a specific record, optionally writing ProfilesSent and CompletedAt.
+
+    Args:
+        record_id: Airtable Record ID
+        status: Status value (e.g., "✅ Ready to Launch")
+        error_message: Optional error message (logged only)
+        profiles_sent: Optional profile count to write to ProfilesSent field
+        completed_at: Optional ISO 8601 timestamp to write to CompletedAt field
     """
     try:
         table = get_airtable_table()
+
+        # Build fields dict dynamically
         fields = {"Status": status}
+
+        if profiles_sent is not None:
+            fields["ProfilesSent"] = profiles_sent
+            logger.info(f"Writing ProfilesSent={profiles_sent} for {record_id}")
+
+        if completed_at is not None:
+            fields["CompletedAt"] = completed_at
+            logger.info(f"Writing CompletedAt={completed_at} for {record_id}")
+
         if error_message:
             logger.error(f"Error for {record_id}: {error_message}")
+            # Note: ErrorNotes field not written yet (future enhancement)
 
         table.update(record_id, fields)
         logger.info(f"Updated record {record_id} to status: {status}")
     except Exception as e:
         error_str = str(e)
         if "INVALID_MULTIPLE_CHOICE_OPTIONS" in error_str:
-            logger.warning(f"Status '{status}' is not a valid Airtable option for {record_id}. Skipping status update. Error: {error_message}")
+            logger.warning(f"Status '{status}' is not a valid Airtable option for {record_id}. Skipping status update.")
         else:
             logger.error(f"Failed to update record {record_id}: {e}")

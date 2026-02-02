@@ -6,19 +6,33 @@ import time
 from typing import Dict, Any
 from tenacity import retry, stop_after_attempt, wait_exponential
 from openai import OpenAI
+import debug_state
 
 # Valid LOG LEVELS
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Constants
-MAX_TURNS = 60  # Increased limit for complex filter flows
+MAX_TURNS = 20  # Reduced: filters applied deterministically, GPT-4o only verifies + clicks Add to table
 
 @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=2, min=5, max=60))
 def call_with_retry(func, *args, **kwargs):
     return func(*args, **kwargs)
 
 openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+def parse_js_json(result):
+    """Parse JSON from agent-browser eval results, handling double-encoding."""
+    if not isinstance(result, str):
+        return result
+    try:
+        data = json.loads(result)
+        # Handle double-encoded JSON: agent-browser may wrap string results in quotes
+        if isinstance(data, str):
+            data = json.loads(data)
+        return data
+    except (json.JSONDecodeError, TypeError):
+        return result  # Return raw string if not valid JSON
 
 # Ensure all agent-browser calls share the same session context for cookie persistence
 os.environ["AGENT_BROWSER_SESSION"] = "clay_automation_session"
@@ -123,6 +137,61 @@ def parse_ref(snapshot: str, element_label: str) -> str:
             if len(parts) > 1:
                 return parts[1].split(']')[0]
     return None
+
+def _find_combobox_between(snapshot, after_text, before_text):
+    """Find first combobox ref between two text markers in -i snapshot.
+    Used to locate pill input fields that lose their labels after pills are added."""
+    lines = snapshot.split('\n')
+    found_after = False
+    for line in lines:
+        if after_text.lower() in line.lower():
+            found_after = True
+            continue
+        if found_after and before_text and before_text.lower() in line.lower():
+            break
+        if found_after and 'combobox' in line.lower() and '[ref=' in line:
+            parts = line.split('[ref=')
+            if len(parts) > 1:
+                return parts[1].split(']')[0]
+    return None
+
+
+def _find_ref_exact(snapshot, element_type, label_text, exclude_text=None):
+    """Find element ref by type and label, with optional exclusion."""
+    for line in snapshot.split('\n'):
+        line_lower = line.lower()
+        if element_type.lower() not in line_lower:
+            continue
+        if label_text.lower() not in line_lower:
+            continue
+        if exclude_text and exclude_text.lower() in line_lower:
+            continue
+        parts = line.split('[ref=')
+        if len(parts) > 1:
+            return parts[1].split(']')[0]
+    return None
+
+
+def _is_section_expanded(snapshot, section_ref):
+    """Check if a section (button with ref) is expanded in -i snapshot."""
+    for line in snapshot.split('\n'):
+        if f'ref={section_ref}' in line:
+            return '[expanded]' in line
+    return False
+
+
+def _expand_section(snapshot, section_text):
+    """Find and expand a section by its text label if not already expanded.
+    Returns (new_snapshot, success)."""
+    ref = parse_ref(snapshot, section_text)
+    if not ref:
+        return snapshot, False
+    if not _is_section_expanded(snapshot, ref):
+        run_agent_browser_command(["click", f"@{ref}"])
+        time.sleep(1)
+        snapshot = run_agent_browser_command(["snapshot", "-i"])
+    return snapshot, True
+
 
 def focus_input_by_text(text: str) -> str:
     """Focus an input element by placeholder, aria-label, or partial match.
@@ -411,93 +480,1053 @@ Return ONLY valid JSON (no markdown, no explanation):
         logger.error(f"Error interpreting criteria: {e}")
         raise
 
-def trigger_enrichment() -> Dict[str, Any]:
+# Default import limit for Clay People Search
+IMPORT_LIMIT = 100
+
+def set_import_limit(limit: int = IMPORT_LIMIT) -> bool:
     """
-    After import, clicks the 'Create Profile' play button to trigger n8n webhook enrichment.
+    Set the 'Limit results' field using snapshot -i + fill @eX.
+    Uses native agent-browser scroll + fill commands instead of JS eval.
+    Playwright's fill simulates real keystrokes, properly triggering React state updates.
+    """
+    logger.info(f"[IMPORT] Setting import limit to {limit}...")
+
+    # Scroll sidebar down to reveal Limit section (it's near the bottom)
+    run_agent_browser_command(["scroll", "down"])
+    time.sleep(1)
+
+    snap = run_agent_browser_command(["snapshot", "-i"])
+
+    # Expand "Limit results" section if collapsed
+    snap, found = _expand_section(snap, "Limit results")
+    if not found:
+        # Try scrolling more
+        run_agent_browser_command(["scroll", "down"])
+        time.sleep(1)
+        snap = run_agent_browser_command(["snapshot", "-i"])
+        snap, found = _expand_section(snap, "Limit results")
+
+    # Find the Limit spinbutton (not "Limit per company")
+    limit_ref = _find_ref_exact(snap, 'spinbutton', '"Limit"', exclude_text='per company')
+    if not limit_ref:
+        # Broader search
+        limit_ref = _find_ref_exact(snap, 'spinbutton', 'Limit', exclude_text='per company')
+    if not limit_ref:
+        logger.warning("[IMPORT] Limit spinbutton not found in snapshot")
+        logger.info(f"[IMPORT] Snapshot for debug:\n{snap[:500]}")
+        return False
+
+    # Fill the limit value using native Playwright fill (triggers React events)
+    res = run_agent_browser_command(["fill", f"@{limit_ref}", str(limit)])
+    if res and "Error" in res:
+        logger.warning(f"[IMPORT] Failed to fill limit: {res}")
+        return False
+
+    time.sleep(1)
+    logger.info(f"[IMPORT] Import limit set to {limit}")
+    return True
+
+
+# Known country names — route to "Countries to include" instead of "Cities to include"
+COUNTRY_NAMES = {
+    "united states", "usa", "us", "united kingdom", "uk", "great britain",
+    "canada", "australia", "germany", "france", "india", "brazil",
+    "japan", "china", "singapore", "israel", "netherlands", "sweden",
+    "norway", "denmark", "finland", "ireland", "spain", "italy",
+    "switzerland", "austria", "belgium", "portugal", "new zealand",
+    "south korea", "mexico", "argentina", "chile", "colombia",
+    "south africa", "nigeria", "kenya", "egypt", "uae",
+    "united arab emirates", "saudi arabia", "qatar", "poland",
+    "czech republic", "romania", "hungary", "philippines", "thailand",
+    "vietnam", "indonesia", "malaysia", "taiwan", "hong kong",
+}
+
+# US state abbreviations to strip from city names (e.g., "San Francisco CA" → "San Francisco")
+US_STATE_ABBREVS = {
+    "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA",
+    "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD",
+    "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ",
+    "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC",
+    "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY",
+    "DC",
+}
+
+def _parse_location(location_str):
+    """Classify a location as 'country' or 'city' and clean the name.
+    - "United States" → ("country", "United States")
+    - "San Francisco CA" → ("city", "San Francisco")
+    - "New York NY" → ("city", "New York")
+    - "London" → ("city", "London")
+    """
+    loc = location_str.strip()
+    if loc.lower() in COUNTRY_NAMES:
+        return ("country", loc)
+    # Strip trailing US state abbreviation
+    # Handles: "San Francisco CA", "San Francisco, CA", "New York, NY"
+    if "," in loc:
+        comma_parts = [p.strip() for p in loc.split(",")]
+        if len(comma_parts) == 2 and comma_parts[1].upper() in US_STATE_ABBREVS:
+            return ("city", comma_parts[0])
+    parts = loc.rsplit(" ", 1)
+    if len(parts) == 2 and parts[1].upper() in US_STATE_ABBREVS:
+        return ("city", parts[0])
+    return ("city", loc)
+
+
+def _take_filter_screenshot(name, scroll_to_top=False):
+    """Take a named screenshot during filter application for visual verification."""
+    try:
+        if scroll_to_top:
+            for _ in range(5):
+                run_agent_browser_command(["scroll", "up"])
+            time.sleep(0.5)
+        path = debug_state.named_screenshot_path(name)
+        res = run_agent_browser_command(["screenshot", path])
+        if res and "Error" not in res:
+            logger.info(f"[SCREENSHOT] Saved: {name}")
+        else:
+            logger.warning(f"[SCREENSHOT] Failed: {name}: {res}")
+    except Exception as e:
+        logger.warning(f"[SCREENSHOT] Exception: {name}: {e}")
+
+
+def apply_filters_deterministic(search_criteria):
+    """
+    Apply all Clay People Search filters deterministically using snapshot -i + fill @eX.
+    Called BEFORE the GPT-4o verification loop.
+
+    Key patterns proven in probe:
+    - Job titles: fill combobox + Enter creates pills
+    - Exclusions: fill combobox + Enter creates pills
+    - Cities: fill combobox + click autocomplete option
+    - Seniority: click combobox + click options
+    - Limit: fill spinbutton
+    - CRITICAL: refs shift after each DOM change — re-snapshot before every fill
+
+    Returns dict with results of each filter step.
+    """
+    results = {"seniority": False, "titles": False, "exclusions": False,
+               "locations": False, "limit": False, "failed_filters": []}
+
+    seniority = search_criteria.get("seniority", [])
+    titles = search_criteria.get("titles", [])
+    exclusions = search_criteria.get("excludeKeywords", [])
+    locations = search_criteria.get("locations", [])
+
+    # Take initial interactive snapshot
+    snap = run_agent_browser_command(["snapshot", "-i"])
+    logger.info(f"[FILTERS] Initial snapshot ({len(snap)} chars)")
+
+    # --- 1. EXPAND JOB TITLE SECTION ---
+    snap, expanded = _expand_section(snap, "Job title")
+    if not expanded:
+        logger.warning("[FILTERS] Job title section not found — may already be expanded")
+
+    # --- 2. SENIORITY (click-based multi-select dropdown) ---
+    if seniority:
+        logger.info(f"[FILTERS] Applying seniority: {seniority}")
+        snap = run_agent_browser_command(["snapshot", "-i"])
+
+        sen_ref = parse_ref(snap, 'combobox "Seniority"')
+        if not sen_ref:
+            sen_ref = parse_ref(snap, 'Seniority')
+
+        if sen_ref:
+            run_agent_browser_command(["click", f"@{sen_ref}"])
+            time.sleep(1)
+            snap = run_agent_browser_command(["snapshot", "-i"])
+
+            for level in seniority:
+                opt_ref = _find_ref_exact(snap, 'option', f'"{level}"')
+                if not opt_ref:
+                    opt_ref = parse_ref(snap, level)
+                if opt_ref:
+                    run_agent_browser_command(["click", f"@{opt_ref}"])
+                    time.sleep(0.5)
+                    snap = run_agent_browser_command(["snapshot", "-i"])
+                    logger.info(f"[FILTERS] Selected seniority: {level}")
+                else:
+                    logger.warning(f"[FILTERS] Seniority option not found: {level}")
+                    results["failed_filters"].append(f"seniority:{level}")
+
+            run_agent_browser_command(["press", "Escape"])
+            time.sleep(1)
+            results["seniority"] = True
+            _take_filter_screenshot("filter_01_seniority", scroll_to_top=True)
+        else:
+            logger.warning("[FILTERS] Seniority combobox not found")
+            results["failed_filters"].append("seniority")
+
+    # --- 3. JOB TITLES (pill input via combobox fill + Enter) ---
+    # KEY FIX: Do NOT press Escape between pills — it closes the input, hiding the
+    # combobox from subsequent snapshots. Only Escape after ALL pills are entered.
+    # Ref: SKILL.md pattern: "Type → Enter to add pill → repeat → ESC only after done"
+    if titles:
+        logger.info(f"[FILTERS] Applying job titles: {titles}")
+        snap = run_agent_browser_command(["snapshot", "-i"])
+
+        titles_applied = 0
+        for i, title in enumerate(titles):
+            # Strategy 1: placeholder label (works for first pill)
+            title_ref = parse_ref(snap, 'e.g. CEO')
+            # Strategy 2: combobox between text markers
+            if not title_ref:
+                title_ref = _find_combobox_between(snap, "is similar to", "Job titles to exclude")
+            # Strategy 3: combobox after Clear chip buttons
+            if not title_ref:
+                title_ref = _find_combobox_between(snap, "Clear chip", "Job titles to exclude")
+            # Strategy 4: combobox after last entered title
+            if not title_ref and titles_applied > 0:
+                title_ref = _find_combobox_between(snap, titles[titles_applied - 1], "Job titles to exclude")
+            # Strategy 5: click section area to activate hidden input, re-snapshot
+            if not title_ref:
+                section_ref = parse_ref(snap, "is similar to")
+                if section_ref:
+                    run_agent_browser_command(["click", f"@{section_ref}"])
+                    time.sleep(1)
+                    snap = run_agent_browser_command(["snapshot", "-i"])
+                    title_ref = parse_ref(snap, 'e.g. CEO')
+                    if not title_ref:
+                        title_ref = _find_combobox_between(snap, "is similar to", "Job titles to exclude")
+                    if not title_ref:
+                        title_ref = _find_combobox_between(snap, "Clear chip", "Job titles to exclude")
+
+            if not title_ref:
+                logger.warning(f"[FILTERS] Title input not found for '{title}' (pill {i+1})")
+                logger.info(f"[FILTERS] Snapshot for debug (title ref search):\n{snap[:2000]}")
+                results["failed_filters"].append(f"title:{title}")
+                continue  # Try remaining titles instead of breaking
+
+            res = run_agent_browser_command(["fill", f"@{title_ref}", title])
+            if res and "Error" in res:
+                logger.warning(f"[FILTERS] Fill failed for title '{title}': {res}")
+                results["failed_filters"].append(f"title:{title}")
+                continue  # Try remaining titles
+
+            time.sleep(1)
+            run_agent_browser_command(["press", "Enter"])
+            time.sleep(1)
+            # NO Escape here — keep input active for next pill
+
+            # Re-snapshot — refs shift after pill creation
+            snap = run_agent_browser_command(["snapshot", "-i"])
+            titles_applied += 1
+            logger.info(f"[FILTERS] Added title pill {titles_applied}/{len(titles)}: {title}")
+            _take_filter_screenshot(f"filter_02_title_{titles_applied}", scroll_to_top=True)
+
+        # Escape ONCE after all titles are done
+        run_agent_browser_command(["press", "Escape"])
+        time.sleep(0.5)
+
+        results["titles"] = titles_applied == len(titles)
+        results["titles_applied"] = titles_applied
+        results["titles_total"] = len(titles)
+        if titles_applied < len(titles):
+            logger.warning(f"[FILTERS] PARTIAL: Only {titles_applied}/{len(titles)} title pills created")
+        _take_filter_screenshot("filter_02_titles_final", scroll_to_top=True)
+
+    # --- 4. EXCLUSIONS (pill input via combobox fill + Enter) ---
+    # Same Escape fix as titles: only Escape after all exclusions are entered
+    if exclusions:
+        logger.info(f"[FILTERS] Applying exclusions: {exclusions}")
+        snap = run_agent_browser_command(["snapshot", "-i"])
+
+        exclusions_applied = 0
+        for i, keyword in enumerate(exclusions):
+            excl_ref = parse_ref(snap, 'Job titles to exclude')
+            if not excl_ref:
+                excl_ref = parse_ref(snap, 'exclude')
+
+            if not excl_ref:
+                logger.warning(f"[FILTERS] Exclusion input not found for '{keyword}'")
+                logger.info(f"[FILTERS] Snapshot for debug (exclusion ref search):\n{snap[:2000]}")
+                results["failed_filters"].append(f"exclusion:{keyword}")
+                continue  # Try remaining exclusions
+
+            res = run_agent_browser_command(["fill", f"@{excl_ref}", keyword])
+            if res and "Error" in res:
+                logger.warning(f"[FILTERS] Fill failed for exclusion '{keyword}': {res}")
+                results["failed_filters"].append(f"exclusion:{keyword}")
+                continue  # Try remaining exclusions
+
+            time.sleep(1)
+            run_agent_browser_command(["press", "Enter"])
+            time.sleep(1)
+            # NO Escape between pills — keep input active
+
+            snap = run_agent_browser_command(["snapshot", "-i"])
+            exclusions_applied += 1
+            logger.info(f"[FILTERS] Added exclusion pill {exclusions_applied}/{len(exclusions)}: {keyword}")
+
+        # Escape ONCE after all exclusions are done
+        run_agent_browser_command(["press", "Escape"])
+        time.sleep(0.5)
+
+        results["exclusions"] = exclusions_applied == len(exclusions)
+        results["exclusions_applied"] = exclusions_applied
+        results["exclusions_total"] = len(exclusions)
+        if exclusions_applied < len(exclusions):
+            logger.warning(f"[FILTERS] PARTIAL: Only {exclusions_applied}/{len(exclusions)} exclusion pills created")
+        _take_filter_screenshot("filter_03_exclusions", scroll_to_top=True)
+
+    # --- 5. LOCATIONS (route countries vs cities to correct sub-fields) ---
+    if locations:
+        logger.info(f"[FILTERS] Applying locations: {locations}")
+
+        # Classify each location as country or city
+        countries = []
+        cities = []
+        for loc in locations:
+            loc_type, clean_name = _parse_location(loc)
+            if loc_type == "country":
+                countries.append(clean_name)
+            else:
+                cities.append(clean_name)
+        logger.info(f"[FILTERS] Location routing: countries={countries}, cities={cities}")
+
+        # Scroll down to reveal Location section
+        run_agent_browser_command(["scroll", "down"])
+        time.sleep(1)
+        snap = run_agent_browser_command(["snapshot", "-i"])
+
+        # Expand Location section
+        snap, expanded = _expand_section(snap, "Location")
+        if not expanded:
+            run_agent_browser_command(["scroll", "down"])
+            time.sleep(1)
+            snap = run_agent_browser_command(["snapshot", "-i"])
+            snap, expanded = _expand_section(snap, "Location")
+
+        locations_applied = 0
+
+        # --- 5a. Countries (with retry + fuzzy matching) ---
+        for country in countries:
+            country_applied = False
+            for attempt in range(2):  # Up to 2 attempts
+                snap = run_agent_browser_command(["snapshot", "-i"])
+                country_ref = parse_ref(snap, 'Countries to include')
+
+                if not country_ref:
+                    logger.warning(f"[FILTERS] 'Countries to include' not found for '{country}' (attempt {attempt+1})")
+                    if attempt == 0:
+                        run_agent_browser_command(["scroll", "down"])
+                        time.sleep(1)
+                        continue
+                    results["failed_filters"].append(f"location:{country}")
+                    break
+
+                # Clear any previous value on retry
+                if attempt > 0:
+                    run_agent_browser_command(["fill", f"@{country_ref}", ""])
+                    time.sleep(0.5)
+
+                res = run_agent_browser_command(["fill", f"@{country_ref}", country])
+                if res and "Error" in res:
+                    logger.warning(f"[FILTERS] Fill failed for country '{country}': {res}")
+                    if attempt == 0:
+                        continue
+                    results["failed_filters"].append(f"location:{country}")
+                    break
+
+                time.sleep(3)  # Increased from 2s — Clay autocomplete needs time
+                snap = run_agent_browser_command(["snapshot", "-i"])
+                logger.info(f"[FILTERS] Country autocomplete snapshot (attempt {attempt+1}):\n{snap[:1500]}")
+
+                # Fuzzy option matching — try multiple strategies
+                opt_ref = None
+
+                # Try 1: exact match with quotes
+                opt_ref = _find_ref_exact(snap, 'option', f'"{country}"')
+
+                # Try 2: exact match without quotes
+                if not opt_ref:
+                    opt_ref = _find_ref_exact(snap, 'option', country)
+
+                # Try 3: partial match — country name contained in option text
+                if not opt_ref:
+                    for line in snap.split('\n'):
+                        if 'option' in line.lower() and '[ref=' in line:
+                            if country.lower() in line.lower():
+                                parts = line.split('[ref=')
+                                if len(parts) > 1:
+                                    opt_ref = parts[1].split(']')[0]
+                                    logger.info(f"[FILTERS] Country partial match: '{country}' in '{line.strip()[:100]}'")
+                                    break
+
+                # Try 4: select first autocomplete option (most relevant)
+                if not opt_ref:
+                    for line in snap.split('\n'):
+                        if 'option' in line.lower() and '[ref=' in line:
+                            parts = line.split('[ref=')
+                            if len(parts) > 1:
+                                opt_ref = parts[1].split(']')[0]
+                                logger.info(f"[FILTERS] Country: selecting first autocomplete option: '{line.strip()[:100]}'")
+                                break
+
+                if opt_ref:
+                    run_agent_browser_command(["click", f"@{opt_ref}"])
+                    time.sleep(1)
+                    country_applied = True
+                    locations_applied += 1
+                    logger.info(f"[FILTERS] Selected country: {country}")
+                    break  # Success, exit retry loop
+                elif attempt == 0:
+                    logger.info(f"[FILTERS] No autocomplete options for '{country}', retrying...")
+                    run_agent_browser_command(["press", "Escape"])
+                    time.sleep(1)
+                    continue
+                else:
+                    # Don't count Enter fallback as success — unreliable for countries
+                    logger.warning(f"[FILTERS] Country '{country}' autocomplete failed after 2 attempts")
+                    run_agent_browser_command(["press", "Escape"])
+                    results["failed_filters"].append(f"country_autocomplete:{country}")
+
+            if country_applied:
+                run_agent_browser_command(["press", "Escape"])
+                time.sleep(0.5)
+
+        # --- 5b. Cities ---
+        for city in cities:
+            snap = run_agent_browser_command(["snapshot", "-i"])
+            city_ref = parse_ref(snap, 'Cities to include')
+
+            if not city_ref:
+                logger.warning(f"[FILTERS] 'Cities to include' combobox not found for '{city}'")
+                results["failed_filters"].append(f"location:{city}")
+                continue
+
+            res = run_agent_browser_command(["fill", f"@{city_ref}", city])
+            if res and "Error" in res:
+                logger.warning(f"[FILTERS] Fill failed for city '{city}': {res}")
+                results["failed_filters"].append(f"location:{city}")
+                continue
+
+            time.sleep(3)  # Increased from 2s for autocomplete
+            snap = run_agent_browser_command(["snapshot", "-i"])
+
+            opt_ref = _find_ref_exact(snap, 'option', f'"{city}"')
+            if not opt_ref:
+                opt_ref = parse_ref(snap, f'option "{city}')
+            if not opt_ref:
+                opt_ref = parse_ref(snap, city)
+
+            if opt_ref:
+                run_agent_browser_command(["click", f"@{opt_ref}"])
+                time.sleep(1)
+                locations_applied += 1
+                logger.info(f"[FILTERS] Selected city: {city}")
+            else:
+                run_agent_browser_command(["press", "Enter"])
+                time.sleep(1)
+                locations_applied += 1
+                logger.info(f"[FILTERS] Entered city (free-text): {city}")
+
+            run_agent_browser_command(["press", "Escape"])
+            time.sleep(0.5)
+
+        results["locations"] = locations_applied > 0
+        _take_filter_screenshot("filter_04_locations")
+
+    # --- 6. IMPORT LIMIT ---
+    results["limit"] = set_import_limit(IMPORT_LIMIT)
+    _take_filter_screenshot("filter_05_limit")
+
+    # --- Scroll to top for final overview screenshot ---
+    _take_filter_screenshot("filter_06_final_top", scroll_to_top=True)
+
+    # --- Summary ---
+    logger.info(f"[FILTERS] Deterministic filter results: {json.dumps(results)}")
+    return results
+
+
+def wait_for_add_button_enabled(max_wait=90, poll_interval=5):
+    """
+    Poll snapshots until the 'Add to table' button is enabled (not loading).
+    Clay disables the button with a loading spinner while computing search results
+    after filter changes. Must wait for loading to complete before clicking.
+
+    Returns: (button_ref, snapshot) if found enabled, (None, snapshot) if timeout.
+    """
+    logger.info("[IMPORT] Waiting for 'Add to table' button to become enabled...")
+
+    # Scroll up to ensure the button area is visible (filters may have scrolled down)
+    run_agent_browser_command(["scroll", "up"])
+    run_agent_browser_command(["scroll", "up"])
+    time.sleep(2)
+
+    elapsed = 0
+    last_snap = ""
+    while elapsed < max_wait:
+        snap = run_agent_browser_command(["snapshot", "-i"])
+        last_snap = snap
+
+        # Look for "Add to table" button ref
+        button_ref = None
+        is_disabled = False
+        for line in snap.split('\n'):
+            if 'add to table' in line.lower() and '[ref=' in line:
+                parts = line.split('[ref=')
+                if len(parts) > 1:
+                    button_ref = parts[1].split(']')[0]
+                    # Check if button has [disabled] marker
+                    is_disabled = '[disabled]' in line.lower()
+                    break
+
+        if button_ref and not is_disabled:
+            logger.info(f"[IMPORT] 'Add to table' button is enabled: @{button_ref} (waited {elapsed}s)")
+            return button_ref, snap
+        elif button_ref:
+            logger.info(f"[IMPORT] Button found but disabled (loading), waiting... ({elapsed}s/{max_wait}s)")
+        else:
+            logger.info(f"[IMPORT] Button not found in snapshot, scrolling up... ({elapsed}s/{max_wait}s)")
+            run_agent_browser_command(["scroll", "up"])
+
+        time.sleep(poll_interval)
+        elapsed += poll_interval
+
+    logger.warning(f"[IMPORT] Timeout waiting for button after {max_wait}s")
+    return None, last_snap
+
+
+def click_add_to_table_deterministic():
+    """
+    Deterministically wait for and click the 'Add to table' button.
+    Handles: loading state wait, confirmation dialogs, page transition verification.
+
+    Returns: dict with import/enrichment results, or None if button not found (fall back to GPT-4o).
+    """
+    logger.info("[IMPORT] Starting deterministic 'Add to table' flow...")
+
+    # Step 1: Wait for button to become enabled (Clay loads results after filter changes)
+    button_ref, snap = wait_for_add_button_enabled(max_wait=90, poll_interval=5)
+
+    if not button_ref:
+        logger.warning("[IMPORT] Button never became enabled — falling back to GPT-4o")
+        return None
+
+    # Step 2: Capture expected count before clicking
+    expected_count = capture_search_count()
+    logger.info(f"[IMPORT] Expected count before click: {expected_count}")
+
+    # Step 3: Take debug screenshot before clicking
+    try:
+        _ss_path = os.path.join(debug_state.SCREENSHOT_DIR, "pre_import.png")
+        debug_state._ensure_screenshot_dir()
+        run_agent_browser_command(["screenshot", _ss_path])
+    except Exception:
+        pass
+
+    # Step 4: Click the button
+    res = run_agent_browser_command(["click", f"@{button_ref}"])
+    logger.info(f"[IMPORT] Click 'Add to table' result: {res}")
+
+    if res and "Error" in res:
+        # Button ref may have shifted — re-snapshot and try once more
+        logger.warning(f"[IMPORT] Click failed: {res}. Re-snapshotting...")
+        snap = run_agent_browser_command(["snapshot", "-i"])
+        for line in snap.split('\n'):
+            if 'add to table' in line.lower() and '[ref=' in line and '[disabled]' not in line.lower():
+                parts = line.split('[ref=')
+                if len(parts) > 1:
+                    button_ref = parts[1].split(']')[0]
+                    res = run_agent_browser_command(["click", f"@{button_ref}"])
+                    logger.info(f"[IMPORT] Retry click result: {res}")
+                    break
+    time.sleep(3)
+
+    # Step 5: Handle confirmation dialog (if any)
+    snap = run_agent_browser_command(["snapshot", "-i"])
+    for keyword in ['confirm', 'import', 'yes']:
+        confirm_ref = None
+        for line in snap.split('\n'):
+            if keyword in line.lower() and ('button' in line.lower() or '[ref=' in line):
+                if 'add to table' not in line.lower():  # Don't re-click the same button
+                    parts = line.split('[ref=')
+                    if len(parts) > 1:
+                        confirm_ref = parts[1].split(']')[0]
+                        break
+        if confirm_ref:
+            logger.info(f"[IMPORT] Clicking confirmation button: @{confirm_ref} (matched '{keyword}')")
+            run_agent_browser_command(["click", f"@{confirm_ref}"])
+            time.sleep(3)
+            break
+
+    # Step 6: Wait for page transition (find-people → table view)
+    logger.info("[IMPORT] Waiting for page transition after click...")
+    for wait_round in range(12):  # Up to 60 seconds
+        time.sleep(5)
+        current_url = run_agent_browser_command(["get", "url"]).strip()
+        logger.info(f"[IMPORT] Page check {wait_round+1}/12: {current_url}")
+
+        if "find-people" not in current_url.lower():
+            logger.info(f"[IMPORT] Page transitioned to: {current_url}")
+            # Take post-import screenshot
+            try:
+                _post_ss = os.path.join(debug_state.SCREENSHOT_DIR, "post_import.png")
+                run_agent_browser_command(["screenshot", _post_ss])
+            except Exception:
+                pass
+            # Import triggered — wait for rows and trigger enrichment
+            import_result = wait_for_import_completion(expected_count)
+            enrichment_result = trigger_enrichment(
+                expected_count=expected_count,
+                import_result=import_result
+            )
+            return {
+                "success": True,
+                "profiles_triggered": enrichment_result.get("count", 0),
+                "enrichment_started": enrichment_result.get("started", False),
+                "import_rows": import_result.get("row_count", 0),
+            }
+
+    # Page didn't transition — check if button is gone (import may have happened inline)
+    logger.warning("[IMPORT] Page didn't transition after 60s. Checking page state...")
+    snap = run_agent_browser_command(["snapshot", "-i"])
+    if "add to table" not in snap.lower():
+        logger.info("[IMPORT] 'Add to table' button gone — import may have triggered inline")
+        import_result = wait_for_import_completion(expected_count)
+        enrichment_result = trigger_enrichment(
+            expected_count=expected_count,
+            import_result=import_result
+        )
+        return {
+            "success": True,
+            "profiles_triggered": enrichment_result.get("count", 0),
+            "enrichment_started": enrichment_result.get("started", False),
+            "import_rows": import_result.get("row_count", 0),
+        }
+
+    logger.warning("[IMPORT] Import may not have triggered — falling back to GPT-4o")
+    return None
+
+
+def capture_search_count() -> int:
+    """
+    Capture the expected profile count from Clay's search results page
+    before clicking 'Add to table'.
+
+    Clay UI shows:
+    - Top bar: "Previewing 50 of 1,362 results. 100 will be..."
+    - Left sidebar 'Limit results' section: input field with limit value (e.g. 100)
+    The Limit input value = number of profiles that will actually be imported.
 
     Returns:
-        dict: {"count": int, "started": bool, "error": str (optional)}
+        int: Expected profile count, or None if not found.
     """
-    logger.info("[ENRICHMENT] Starting enrichment trigger sequence...")
+    logger.info("[IMPORT] Capturing expected profile count from search results...")
+
+    capture_js = """
+    (function() {
+        // Strategy 1: Read the Limit input field value from the sidebar
+        // The 'Limit results' section has an input with the import count
+        let allInputs = document.querySelectorAll('input');
+        for (let input of allInputs) {
+            // Check if this input is near text containing 'Limit'
+            let parent = input.closest('div, section, label, fieldset');
+            if (parent) {
+                let parentText = parent.textContent || '';
+                if (parentText.includes('Limit') && !parentText.includes('Limit per company')) {
+                    let val = parseInt(input.value);
+                    if (val > 0 && val < 100000) {
+                        return JSON.stringify({"count": val, "source": "limit_input"});
+                    }
+                }
+            }
+        }
+
+        // Strategy 1b: Look for number inputs specifically
+        let numInputs = document.querySelectorAll('input[type="number"], input[inputmode="numeric"]');
+        for (let input of numInputs) {
+            let val = parseInt(input.value);
+            if (val > 0 && val < 100000) {
+                let parent = input.closest('div, section');
+                let parentText = parent ? (parent.textContent || '') : '';
+                if (parentText.includes('Limit')) {
+                    return JSON.stringify({"count": val, "source": "number_input"});
+                }
+            }
+        }
+
+        // Strategy 2: Parse top preview bar text - "X will be added"
+        let bodyText = document.body.innerText;
+        let willBeMatch = bodyText.match(/(\\d[\\d,]*)\\s+will\\s+be/i);
+        if (willBeMatch) {
+            let count = parseInt(willBeMatch[1].replace(/,/g, ''));
+            if (count > 0) {
+                return JSON.stringify({"count": count, "source": "will_be_text", "match": willBeMatch[0]});
+            }
+        }
+
+        // Strategy 3: Parse "Previewing X of Y results" and use Y
+        let previewMatch = bodyText.match(/Previewing\\s+\\d+\\s+of\\s+([\\d,]+)\\s+results/i);
+        if (previewMatch) {
+            let total = parseInt(previewMatch[1].replace(/,/g, ''));
+            if (total > 0) {
+                return JSON.stringify({"count": total, "source": "total_results", "match": previewMatch[0]});
+            }
+        }
+
+        // Strategy 4: Look for text with "people" or "results" count near Add to table
+        let buttons = document.querySelectorAll('button, a, [role="button"]');
+        for (let btn of buttons) {
+            if (btn.textContent.toLowerCase().includes('add to table')) {
+                let container = btn.closest('div, section, form');
+                if (container) {
+                    let containerText = container.innerText;
+                    let match = containerText.match(/(\\d[\\d,]*)\\s+(?:people|results?|profiles?)/i);
+                    if (match) {
+                        let count = parseInt(match[1].replace(/,/g, ''));
+                        return JSON.stringify({"count": count, "source": "button_container", "match": match[0]});
+                    }
+                }
+            }
+        }
+
+        return JSON.stringify({"count": null, "source": "not_found"});
+    })();
+    """
+
+    result = run_agent_browser_command(["eval", capture_js])
+    logger.info(f"[IMPORT] Search count capture result: {result}")
 
     try:
-        # Step 1: Wait for table view to fully load
-        time.sleep(5)
+        data = parse_js_json(result)
+        count = data.get("count")
+        source = data.get("source", "unknown")
+        if count is not None and count > 0:
+            logger.info(f"[IMPORT] Expected profile count: {count} (source: {source})")
+            return count
+        else:
+            logger.warning(f"[IMPORT] Could not capture profile count (source: {source})")
+            return None
+    except (json.JSONDecodeError, TypeError):
+        logger.warning(f"[IMPORT] Failed to parse search count result: {result}")
+        return None
 
-        # Step 2: Find and click "Create Profile" play button using JS
-        click_play_button_js = """
-        (function() {
-            // Find all column headers
-            let headers = document.querySelectorAll('th, [role="columnheader"], div[class*="header"], div[class*="Header"]');
 
-            for (let header of headers) {
-                let text = header.textContent || header.innerText || '';
-                if (text.includes('Create Profile')) {
-                    // Look for play button (▶) within or near this header
-                    let btn = header.querySelector('button, svg, [role="button"], [class*="play"], [class*="Play"]');
-                    if (!btn) {
-                        // Try parent/sibling elements
-                        btn = header.parentElement?.querySelector('button, svg, [role="button"]');
-                    }
-                    if (btn) {
-                        btn.click();
-                        return 'Clicked Create Profile play button';
-                    }
-                }
+def wait_for_import_completion(expected_count) -> Dict[str, Any]:
+    """
+    Poll the Clay table view until the imported row count matches the expected count
+    or stabilizes (fallback when expected count is unknown).
+
+    Args:
+        expected_count: Expected number of profiles (int), or None for stabilization mode.
+
+    Returns:
+        dict: {"row_count": int, "matched": bool, "timed_out": bool}
+    """
+    MAX_WAIT_SECONDS = 300   # 5 minutes max
+    POLL_INTERVAL = 10       # seconds between polls
+    STABILIZE_CHECKS = 3     # consecutive unchanged counts = done
+    INITIAL_WAIT = 10        # initial wait for page transition
+
+    mode = "count_match" if expected_count is not None else "stabilization"
+    logger.info(f"[IMPORT] Waiting for import completion (mode={mode}, expected={expected_count})")
+
+    # Initial wait for page transition to table view
+    logger.info(f"[IMPORT] Initial wait ({INITIAL_WAIT}s) for page transition to table view...")
+    time.sleep(INITIAL_WAIT)
+
+    # Clay shows row count as "X/Y" (e.g., "49,935/49,935") in the top bar.
+    # This is much more reliable than counting DOM elements (Clay uses virtual scrolling).
+    count_js = """
+    (function() {
+        // Strategy 1: Find "X/Y" row count pattern in the page (Clay table header shows this)
+        // Example: "49,935/49,935" or "100/100"
+        let bodyText = document.body.innerText;
+        let rowCountMatch = bodyText.match(/(\\d[\\d,]*)\\/(\\d[\\d,]*)/);
+        if (rowCountMatch) {
+            let current = parseInt(rowCountMatch[1].replace(/,/g, ''));
+            let total = parseInt(rowCountMatch[2].replace(/,/g, ''));
+            if (current > 0 && total > 0) {
+                return JSON.stringify({"count": current, "total": total, "source": "row_counter_text", "match": rowCountMatch[0]});
             }
-            return 'ERROR: Create Profile play button not found';
-        })();
-        """
+        }
 
-        result = run_agent_browser_command(["eval", click_play_button_js])
-        logger.info(f"[ENRICHMENT] Play button click result: {result}")
-
-        if "ERROR" in result:
-            logger.error("[ENRICHMENT] Failed to find Create Profile play button")
-            return {"count": 0, "started": False, "error": "Play button not found"}
-
-        # Step 3: Wait for dropdown to appear
-        time.sleep(2)
-
-        # Step 4: Click "Run all X rows" option and extract count
-        click_run_all_js = """
-        (function() {
-            // Find the dropdown menu item that says "Run all X rows..."
-            let items = document.querySelectorAll('div[role="menuitem"], li, button, [class*="menu"], [class*="MenuItem"]');
-
-            for (let item of items) {
-                let text = item.textContent || item.innerText || '';
-                if (text.includes('Run all') && text.includes('rows')) {
-                    // Extract the number (e.g., "Run all 25 rows that haven't run or have errors")
-                    let match = text.match(/Run all (\\d+) row/);
-                    let count = match ? parseInt(match[1]) : 0;
-
-                    item.click();
-                    return JSON.stringify({"clicked": true, "count": count, "text": text});
-                }
+        // Strategy 2: Look for "X rows" text
+        let rowsMatch = bodyText.match(/(\\d[\\d,]*)\\s+rows?/i);
+        if (rowsMatch) {
+            let count = parseInt(rowsMatch[1].replace(/,/g, ''));
+            if (count > 0) {
+                return JSON.stringify({"count": count, "source": "rows_text", "match": rowsMatch[0]});
             }
-            return JSON.stringify({"clicked": false, "count": 0, "error": "Run all option not found"});
-        })();
-        """
+        }
 
-        result = run_agent_browser_command(["eval", click_run_all_js])
-        logger.info(f"[ENRICHMENT] Run all click result: {result}")
+        // Strategy 3: Fallback - count visible DOM rows
+        let ariaRows = document.querySelectorAll('[role="row"]');
+        let headerRows = document.querySelectorAll('[role="columnheader"]');
+        let dataRowCount = ariaRows.length > headerRows.length ? ariaRows.length - headerRows.length : ariaRows.length;
+        if (dataRowCount > 0) {
+            return JSON.stringify({"count": dataRowCount, "source": "aria_row"});
+        }
 
-        # Parse JSON result
+        return JSON.stringify({"count": 0, "source": "not_found"});
+    })();
+    """
+
+    elapsed = 0
+    last_count = -1
+    stable_streak = 0
+
+    while elapsed < MAX_WAIT_SECONDS:
+        result = run_agent_browser_command(["eval", count_js])
+
         try:
-            result_data = json.loads(result) if isinstance(result, str) else result
-            if result_data.get("clicked"):
-                count = result_data.get("count", 0)
-                logger.info(f"[ENRICHMENT] Successfully triggered enrichment for {count} profiles")
-                time.sleep(3)  # Wait for enrichment to start
-                return {"count": count, "started": True}
+            data = parse_js_json(result)
+            current_count = data.get("count", 0)
+            source = data.get("source", "unknown")
+        except (json.JSONDecodeError, TypeError):
+            current_count = 0
+            source = "parse_error"
+
+        logger.info(
+            f"[IMPORT] Poll: {current_count}/{expected_count or '?'} rows "
+            f"(elapsed={elapsed}s, source={source})"
+        )
+
+        # Check completion: count_match mode
+        if mode == "count_match" and current_count >= expected_count:
+            logger.info(
+                f"[IMPORT] Import complete! Row count ({current_count}) matches "
+                f"expected ({expected_count}). Elapsed: {elapsed}s"
+            )
+            return {"row_count": current_count, "matched": True, "timed_out": False}
+
+        # Stabilization tracking (applies to BOTH modes)
+        if current_count == last_count and current_count > 0:
+            stable_streak += 1
+            logger.info(f"[IMPORT] Stable streak: {stable_streak}/{STABILIZE_CHECKS}")
+        else:
+            stable_streak = 0
+
+        # Stabilization check (works in both count_match and stabilization modes)
+        # If count has been stable for N consecutive checks, import is likely done
+        if stable_streak >= STABILIZE_CHECKS and current_count > 0:
+            matched = (mode == "count_match" and current_count >= expected_count)
+            logger.info(
+                f"[IMPORT] Import stabilized at {current_count} rows "
+                f"after {STABILIZE_CHECKS} consecutive checks. "
+                f"Elapsed: {elapsed}s, matched={matched}"
+            )
+            return {"row_count": current_count, "matched": matched, "timed_out": False}
+
+        last_count = current_count
+        time.sleep(POLL_INTERVAL)
+        elapsed += POLL_INTERVAL
+
+    # Timeout
+    logger.warning(
+        f"[IMPORT] Timeout after {MAX_WAIT_SECONDS}s. "
+        f"Current rows: {last_count}, expected: {expected_count or '?'}. Proceeding anyway."
+    )
+    return {"row_count": last_count, "matched": False, "timed_out": True}
+
+
+def trigger_enrichment(expected_count=None, import_result=None) -> Dict[str, Any]:
+    """
+    After import completes, clicks the 'Create Profile' play button to trigger
+    n8n webhook enrichment.
+
+    Args:
+        expected_count: Expected profile count (from capture_search_count), or None.
+        import_result: Result from wait_for_import_completion, or None.
+
+    Returns:
+        dict: {"count": int, "started": bool, "error": str (optional),
+               "import_rows": int (optional)}
+    """
+    import_rows = import_result.get("row_count", 0) if import_result else 0
+    logger.info(f"[ENRICHMENT] Starting enrichment trigger sequence... (import_rows={import_rows})")
+
+    try:
+        import re as _re
+
+        def _find_and_click_snapshot(search_text, exclude_text=None, max_retries=3):
+            """
+            Use agent-browser snapshot to find element by text, then native click.
+            Native clicks properly trigger React event handlers (unlike JS DOM clicks).
+            Returns (success: bool, click_result: str, matched_line: str)
+            """
+            search_lower = search_text.lower()
+            exclude_lower = exclude_text.lower() if exclude_text else None
+
+            for attempt in range(max_retries):
+                snapshot_text = run_agent_browser_command(["snapshot"])
+                if not snapshot_text:
+                    time.sleep(2)
+                    continue
+
+                lines = snapshot_text.split('\n')
+
+                # Log snapshot diagnostics on first attempt
+                if attempt == 0:
+                    logger.info(f"[ENRICHMENT] Snapshot: {len(lines)} lines, {len(snapshot_text)} chars")
+                    # Log lines containing keywords for debugging
+                    for i, line in enumerate(lines):
+                        ll = line.lower()
+                        if 'profile' in ll or 'create' in ll or 'run' in ll:
+                            logger.info(f"[ENRICHMENT] Snapshot diag line {i}: {line.strip()[:120]}")
+
+                def _extract_refs(line_text):
+                    """Extract element refs from snapshot line. Handles both @eXX and [ref=eXX] formats."""
+                    # Try [ref=eXX] format first (standard snapshot format)
+                    ref_matches = _re.findall(r'\[ref=(e\d+)\]', line_text)
+                    if ref_matches:
+                        return ['@' + r for r in ref_matches]  # Prepend @ for click command
+                    # Fallback: try @eXX format
+                    at_matches = _re.findall(r'(@e\d+)', line_text)
+                    return at_matches
+
+                # Search with case-insensitive matching
+                for i, line in enumerate(lines):
+                    line_lower = line.lower()
+                    if search_lower in line_lower:
+                        if exclude_lower and exclude_lower in line_lower:
+                            continue
+                        refs = _extract_refs(line)
+                        if refs:
+                            logger.info(f"[ENRICHMENT] Found '{search_text}' at line {i}: {line.strip()[:120]}, refs={refs}")
+                            for ref in refs:
+                                click_result = run_agent_browser_command(["click", ref])
+                                logger.info(f"[ENRICHMENT] Native click {ref}: {click_result}")
+                                if click_result and "error" not in str(click_result).lower():
+                                    return True, click_result, line.strip()
+                                time.sleep(1)
+
+                # Also try matching individual words (handles "Create" + "Profile" on separate elements)
+                if ' ' in search_text:
+                    words = search_text.split()
+                    for i, line in enumerate(lines):
+                        line_lower = line.lower()
+                        if all(w.lower() in line_lower for w in words):
+                            if exclude_lower and exclude_lower in line_lower:
+                                continue
+                            refs = _extract_refs(line)
+                            if refs:
+                                logger.info(f"[ENRICHMENT] Found '{search_text}' (word match) at line {i}: {line.strip()[:120]}, refs={refs}")
+                                for ref in refs:
+                                    click_result = run_agent_browser_command(["click", ref])
+                                    logger.info(f"[ENRICHMENT] Native click {ref}: {click_result}")
+                                    if click_result and "error" not in str(click_result).lower():
+                                        return True, click_result, line.strip()
+                                    time.sleep(1)
+
+                if attempt < max_retries - 1:
+                    logger.info(f"[ENRICHMENT] '{search_text}' not found in snapshot, retrying ({attempt + 1}/{max_retries})...")
+                    time.sleep(3)
+
+            return False, None, None
+
+        # ================================================================
+        # Step 1: Click "Create Profile" column header to open dropdown
+        # Using agent-browser native click (Playwright) for proper React event handling
+        # ================================================================
+        logger.info("[ENRICHMENT] Step 1: Opening 'Create Profile' column header dropdown...")
+
+        header_clicked, header_result, header_line = _find_and_click_snapshot(
+            'Create Profile', exclude_text='Click to run', max_retries=3
+        )
+
+        if not header_clicked:
+            logger.error("[ENRICHMENT] Failed to find/click 'Create Profile' column header")
+            return {"count": 0, "started": False, "error": "Column header not found", "import_rows": import_rows}
+
+        # ================================================================
+        # Step 2: Click "Run column" from the dropdown menu
+        # ================================================================
+        time.sleep(2)  # Wait for dropdown to render
+        logger.info("[ENRICHMENT] Step 2: Clicking 'Run column' from dropdown...")
+
+        run_col_clicked, run_col_result, run_col_line = _find_and_click_snapshot(
+            'Run column', max_retries=2
+        )
+
+        if not run_col_clicked:
+            # Maybe the dropdown didn't open; try clicking header again
+            logger.info("[ENRICHMENT] 'Run column' not found. Re-clicking header and retrying...")
+            _find_and_click_snapshot('Create Profile', exclude_text='Click to run', max_retries=1)
+            time.sleep(3)
+            run_col_clicked, run_col_result, run_col_line = _find_and_click_snapshot(
+                'Run column', max_retries=2
+            )
+
+        if not run_col_clicked:
+            logger.error("[ENRICHMENT] Failed to find/click 'Run column' in dropdown")
+            return {"count": 0, "started": False, "error": "Run column not found in dropdown", "import_rows": import_rows}
+
+        # ================================================================
+        # Step 3: Click "Run all X rows" from the submenu/dialog
+        # ================================================================
+        time.sleep(3)  # Wait for Run dialog to appear
+        logger.info("[ENRICHMENT] Step 3: Clicking 'Run all' from submenu...")
+
+        # Try "Run all" first
+        run_all_clicked, run_all_result, run_all_line = _find_and_click_snapshot(
+            'Run all', max_retries=3
+        )
+
+        # Extract count from the matched line
+        count = 0
+        if run_all_clicked and run_all_line:
+            # Try multiple patterns to extract the row count
+            count_match = _re.search(r'Run all ([\d,]+)', run_all_line)
+            if count_match:
+                count = int(count_match.group(1).replace(',', ''))
             else:
-                error_msg = result_data.get("error", "Unknown error")
-                logger.error(f"[ENRICHMENT] Failed: {error_msg}")
-                return {"count": 0, "started": False, "error": error_msg}
-        except json.JSONDecodeError:
-            logger.error(f"[ENRICHMENT] Failed to parse result: {result}")
-            return {"count": 0, "started": False, "error": "Parse error"}
+                # Try "X rows" pattern anywhere in the line
+                rows_match = _re.search(r'([\d,]+)\s+rows?', run_all_line)
+                if rows_match:
+                    count = int(rows_match.group(1).replace(',', ''))
+
+            # Fallback: use import_rows or expected_count when text has no number
+            # Clay sometimes shows "Run all rows that haven't run or have errors" without a count
+            if count == 0 and import_rows > 0:
+                count = import_rows
+                logger.info(f"[ENRICHMENT] No count in button text, using import_rows={import_rows}")
+            elif count == 0 and expected_count:
+                count = expected_count
+                logger.info(f"[ENRICHMENT] No count in button text, using expected_count={expected_count}")
+
+            logger.info(f"[ENRICHMENT] Successfully triggered enrichment for {count} profiles")
+
+            if expected_count and count > 0 and count != expected_count:
+                logger.warning(
+                    f"[ENRICHMENT] Count mismatch: enrichment reports {count} rows, "
+                    f"expected {expected_count}"
+                )
+
+            time.sleep(3)
+            return {"count": count, "started": True, "import_rows": import_rows}
+
+        # If "Run all" not found, check if there's a different text pattern
+        # Try looking for just "rows that haven't run"
+        logger.info("[ENRICHMENT] 'Run all' not found. Trying 'rows that haven' pattern...")
+        alt_clicked, alt_result, alt_line = _find_and_click_snapshot(
+            "rows that haven", max_retries=2
+        )
+        if alt_clicked and alt_line:
+            count_match = _re.search(r'([\d,]+)\s+rows?', alt_line)
+            count = int(count_match.group(1).replace(',', '')) if count_match else 0
+            # Fallback to import_rows or expected_count
+            if count == 0 and import_rows > 0:
+                count = import_rows
+                logger.info(f"[ENRICHMENT] Alt pattern: no count in text, using import_rows={import_rows}")
+            elif count == 0 and expected_count:
+                count = expected_count
+            logger.info(f"[ENRICHMENT] Alt pattern triggered enrichment for {count} profiles")
+            time.sleep(3)
+            return {"count": count, "started": True, "import_rows": import_rows}
+
+        # Log diagnostic snapshot for debugging
+        logger.info("[ENRICHMENT] Taking diagnostic snapshot...")
+        diag_snapshot = run_agent_browser_command(["snapshot"])
+        if diag_snapshot:
+            for i, line in enumerate(diag_snapshot.split('\n')):
+                if any(kw in line.lower() for kw in ['run', 'column', 'profile', 'menu', 'dialog']):
+                    logger.info(f"[ENRICHMENT] Diag line {i}: {line.strip()[:120]}")
+
+        logger.error("[ENRICHMENT] Failed: Could not find 'Run all' option after all attempts")
+        return {"count": 0, "started": False, "error": "Run all option not found", "import_rows": import_rows}
 
     except Exception as e:
         logger.error(f"[ENRICHMENT] Exception during enrichment trigger: {e}")
@@ -508,7 +1537,12 @@ def run_automation_for_jobseeker(jobseeker: Dict[str, Any]):
     Main agent loop for a single job seeker.
     """
     logger.info(f"Starting automation for JobSeeker: {jobseeker.get('id')}")
-    
+    debug_state.reset_run(
+        record_id=jobseeker.get("id", "unknown"),
+        jobseeker_name=jobseeker.get("name", "Unknown"),
+        max_turns=MAX_TURNS
+    )
+
     # 1. Initialize Browser & Session
     CLAY_URL = "https://app.clay.com/workspaces/579795/w/find-people?destinationTableId=t_0t6pb5u5rFNYudNfngq&workbookId=wb_0t6pb5rpbgD8nRCHvYh"
     
@@ -564,11 +1598,63 @@ def run_automation_for_jobseeker(jobseeker: Dict[str, Any]):
     # 3. Initialize chat history for OpenAI
     # Directive goes in system message (sent once). Snapshots go in user messages per turn.
     # Windowed: keep system message + last N turn pairs to prevent context overflow.
-    CHAT_WINDOW_SIZE = 5  # Keep last 5 turn pairs (10 user+assistant messages)
+    CHAT_WINDOW_SIZE = 6  # Keep last 6 turn pairs — GPT-4o only verifies + clicks Add to table
     system_message = {"role": "system", "content": directive_text}
     chat_messages = []
 
-    # 4. Loop
+    # 3b. Apply ALL filters deterministically BEFORE the GPT-4o loop
+    logger.info("[FILTERS] Applying filters deterministically before GPT-4o loop...")
+    filter_results = apply_filters_deterministic(search_criteria)
+    logger.info(f"[FILTERS] Results: {json.dumps(filter_results)}")
+    time.sleep(2)
+
+    # 3c. Deterministically click "Add to table" — wait for loading, then click
+    # This eliminates the need for GPT-4o in the happy path.
+    # Clay disables the button with a loading spinner while computing results.
+    logger.info("[IMPORT] Attempting deterministic 'Add to table' click...")
+    deterministic_result = click_add_to_table_deterministic()
+    if deterministic_result:
+        logger.info(f"[IMPORT] Deterministic import succeeded: {json.dumps(deterministic_result)}")
+        debug_state.complete_run(deterministic_result)
+        return deterministic_result
+    logger.warning("[IMPORT] Deterministic import failed — falling back to GPT-4o verification loop")
+
+    # Build filter summary for GPT-4o verification prompt (fallback path only)
+    ai_seniority = search_criteria.get("seniority", [])
+    ai_titles = search_criteria.get("titles", [])
+    ai_exclude = search_criteria.get("excludeKeywords", [])
+    ai_locations = search_criteria.get("locations", [])
+    filter_summary_items = []
+    if filter_results.get("seniority"):
+        filter_summary_items.append(f"  OK Seniority: {', '.join(ai_seniority)}")
+    if filter_results.get("titles"):
+        filter_summary_items.append(f"  OK Job Titles: {', '.join(ai_titles)}")
+    if filter_results.get("exclusions"):
+        filter_summary_items.append(f"  OK Exclusions: {', '.join(ai_exclude)}")
+    if filter_results.get("locations"):
+        filter_summary_items.append(f"  OK Locations: {', '.join(ai_locations)}")
+    if filter_results.get("limit"):
+        filter_summary_items.append(f"  OK Import Limit: {IMPORT_LIMIT}")
+    for fail in filter_results.get("failed_filters", []):
+        filter_summary_items.append(f"  FAILED: {fail}")
+    filter_summary = "\n".join(filter_summary_items)
+
+    filter_reminder = f"""
+FILTERS WERE APPLIED PROGRAMMATICALLY. Here are the results:
+{filter_summary}
+
+YOUR JOB:
+1. Look at the snapshot — verify filter pills are visible ("Clear chip" buttons, "X filters" labels)
+2. If all filters look correct, click the "Add to table" button (WAIT if it shows a loading spinner — it will become enabled once results are computed)
+3. Handle any confirmation dialogs
+4. Signal "done" after the page transitions away from the filter view
+Do NOT re-apply filters — they are already set.
+If "Add to table" is disabled/loading, wait a few seconds and try again — do NOT signal fail.
+If a critical filter is visibly MISSING, report with {{"type": "fail", "reason": "Missing filter: X"}}
+"""
+    logger.info(f"[FILTERS] GPT-4o fallback: verification prompt ready")
+
+    # 4. GPT-4o Fallback Loop (only reached if deterministic click failed)
     turn = 0
     last_error = None
     last_action_key = None
@@ -603,8 +1689,8 @@ def run_automation_for_jobseeker(jobseeker: Dict[str, Any]):
 
         
         # Observe
-        # Use --compact to reduce token usage and prevent payload size errors
-        snapshot_json = run_agent_browser_command(["snapshot", "--json", "--compact"])
+        # Use -i for interactive elements only — compact, shows all filter inputs/pills/buttons
+        snapshot_json = run_agent_browser_command(["snapshot", "-i"])
         
         # Check for hard failure in snapshot to avoid infinite loop
         if snapshot_json.startswith("Error:"):
@@ -612,12 +1698,51 @@ def run_automation_for_jobseeker(jobseeker: Dict[str, Any]):
              raise Exception(f"Browser Snapshot Failed: {snapshot_json}")
 
         # Smart truncation: keep first half + last half to preserve both top nav AND bottom buttons
-        MAX_SNAPSHOT_CHARS = 8000
+        # Increased to 20000 to ensure filter sections (job titles, locations) are NOT truncated
+        MAX_SNAPSHOT_CHARS = 20000
         if len(snapshot_json) > MAX_SNAPSHOT_CHARS:
             half = MAX_SNAPSHOT_CHARS // 2
             logger.info(f"Snapshot truncated: {len(snapshot_json)} -> {MAX_SNAPSHOT_CHARS} chars (first {half} + last {half})")
             snapshot_json = snapshot_json[:half] + "\n\n... [MIDDLE TRUNCATED] ...\n\n" + snapshot_json[-half:]
         
+        # Debug: capture screenshot for this turn
+        _debug_ss_path = debug_state.screenshot_path(turn)
+        _debug_ss_ok = False
+        try:
+            _ss_res = run_agent_browser_command(["screenshot", _debug_ss_path])
+            _debug_ss_ok = "Error" not in _ss_res
+        except Exception:
+            pass  # Never break automation for a debug screenshot
+
+        # PAGE-STATE GUARD: ensure we're still on the find-people page
+        current_url = run_agent_browser_command(["get", "url"]).strip()
+        if "find-people" not in current_url.lower():
+            if "login" in current_url.lower():
+                logger.warning(f"[GUARD] Redirected to login page. Re-authenticating...")
+                debug_state.record_turn(turn, snapshot_json[:500], {"type": "guard-relogin"}, "relogin", None, _debug_ss_ok)
+                perform_login()
+                run_agent_browser_command(["open", CLAY_URL])
+                time.sleep(10)
+                continue
+            elif any(kw in current_url.lower() for kw in ["workbook", "table"]):
+                logger.info(f"[GUARD] Page transitioned to table view: {current_url}")
+                import_result = wait_for_import_completion(None)
+                enrichment_result = trigger_enrichment(expected_count=None, import_result=import_result)
+                _result = {
+                    "success": True,
+                    "profiles_triggered": enrichment_result.get("count", 0),
+                    "enrichment_started": enrichment_result.get("started", False),
+                    "import_rows": import_result.get("row_count", 0),
+                }
+                debug_state.record_turn(turn, snapshot_json[:500], {"type": "guard-table-transition"}, "auto-complete", None, _debug_ss_ok)
+                debug_state.complete_run(_result)
+                return _result
+            else:
+                logger.error(f"[GUARD] Unexpected page: {current_url}")
+                debug_state.record_turn(turn, snapshot_json[:500], {"type": "guard-unexpected"}, current_url, None, _debug_ss_ok)
+                debug_state.fail_run(f"Unexpected page: {current_url}")
+                raise Exception(f"Unexpected page: {current_url}")
+
         # Build prompt with previous error if any
         error_context = ""
         if last_error:
@@ -629,19 +1754,29 @@ def run_automation_for_jobseeker(jobseeker: Dict[str, Any]):
             loop_hint = f"\n🔁 LOOP DETECTED: You have repeated the same action ({last_action_key}) {repeat_count} times. You MUST choose a DIFFERENT action type. If you were using focus_placeholder, switch to type_and_enter with the value you want to type. Do NOT repeat the same action.\n"
             logger.warning(f"Loop detected: {last_action_key} repeated {repeat_count} times. Injecting hint.")
 
+        # After turn 8, strongly nudge GPT-4o to click "Add to table" — filters are pre-applied
+        completion_hint = ""
+        if turn >= 8:
+            completion_hint = f"""
+⏰ URGENT: Turn {turn}/{MAX_TURNS}. Filters are already applied programmatically.
+You MUST click "Add to table" NOW. Look for the button in the snapshot and click it immediately.
+"""
+
         # Think — directive is in system message, only send snapshot + instructions per turn
-        prompt = f"""{error_context}{loop_hint}
-CURRENT PAGE STATE (JSON Snapshot):
+        prompt = f"""{error_context}{loop_hint}{completion_hint}
+{filter_reminder}
+
+CURRENT PAGE STATE (Interactive Elements):
 {snapshot_json}
 
 INSTRUCTIONS:
-Decide the next action based on the Directive (in system message) and current page state.
+Filters have been applied programmatically. Your job is to verify and click "Add to table".
+Look for "Clear chip" buttons (indicate pills), "X filters" labels, and the "Add to table" button.
+IMPORTANT: If "Add to table" button is disabled or shows a loading indicator, use "wait" to wait for it to become enabled. Do NOT signal fail for a loading button.
 Return ONLY a JSON object with one of these structures:
 {{"type": "click", "element_id": "@eX", "reason": "why"}}
-{{"type": "fill", "element_id": "@eX", "value": "text", "reason": "why"}}
-{{"type": "type_and_enter", "placeholder": "text", "value": "text", "reason": "Type text and press Enter - use for multi-select pill inputs like job titles, exclusions, cities"}}
+{{"type": "wait", "seconds": 5, "reason": "Waiting for Add to table button to become enabled"}}
 {{"type": "press", "key": "Enter", "reason": "Use for Enter, Escape, or other keys"}}
-{{"type": "click_by_text", "text": "Add to table", "reason": "Click a button by its visible text (use when element ref is not in snapshot)"}}
 {{"type": "scroll", "direction": "down", "pixels": 300, "reason": "Scroll to reveal hidden sections"}}
 {{"type": "done", "reason": "why"}}
 {{"type": "fail", "reason": "why"}}
@@ -718,7 +1853,18 @@ Return ONLY a JSON object with one of these structures:
             if "workbook" in verify_url.lower() or "table" in verify_url.lower():
                 if "find-people" not in verify_url.lower():
                     logger.info("Completion verified: page transitioned to table view after import.")
-                    return True
+                    # Wait for import + trigger enrichment (stabilization mode)
+                    import_result = wait_for_import_completion(None)
+                    enrichment_result = trigger_enrichment(expected_count=None, import_result=import_result)
+                    _result = {
+                        "success": True,
+                        "profiles_triggered": enrichment_result.get("count", 0),
+                        "enrichment_started": enrichment_result.get("started", False),
+                        "import_rows": import_result.get("row_count", 0),
+                    }
+                    debug_state.record_turn(turn, snapshot_json[:500], action, "done-table-view", None, _debug_ss_ok)
+                    debug_state.complete_run(_result)
+                    return _result
             # Reject: still on find-people page with "Add to table" visible
             if "find-people" in verify_url.lower():
                 verify_snapshot = run_agent_browser_command(["snapshot"])
@@ -729,14 +1875,40 @@ Return ONLY a JSON object with one of these structures:
                 else:
                     # On find-people but Add to table is gone — may have been clicked
                     logger.info("Completion verified: on find-people but Add to table button gone.")
-                    return True
+                    # Wait for import + trigger enrichment (stabilization mode)
+                    import_result = wait_for_import_completion(None)
+                    enrichment_result = trigger_enrichment(expected_count=None, import_result=import_result)
+                    _result = {
+                        "success": True,
+                        "profiles_triggered": enrichment_result.get("count", 0),
+                        "enrichment_started": enrichment_result.get("started", False),
+                        "import_rows": import_result.get("row_count", 0),
+                    }
+                    debug_state.record_turn(turn, snapshot_json[:500], action, "done-button-gone", None, _debug_ss_ok)
+                    debug_state.complete_run(_result)
+                    return _result
             # Default accept: not on login, not on find-people — likely transitioned
             logger.info(f"Completion accepted (default): URL={verify_url}")
-            return True
+            # Wait for import + trigger enrichment (stabilization mode)
+            import_result = wait_for_import_completion(None)
+            enrichment_result = trigger_enrichment(expected_count=None, import_result=import_result)
+            _result = {
+                "success": True,
+                "profiles_triggered": enrichment_result.get("count", 0),
+                "enrichment_started": enrichment_result.get("started", False),
+                "import_rows": import_result.get("row_count", 0),
+            }
+            debug_state.record_turn(turn, snapshot_json[:500], action, "done-default", None, _debug_ss_ok)
+            debug_state.complete_run(_result)
+            return _result
         elif action_type == "fail":
             logger.warning(f"Agent reported failure: {action.get('reason')}")
             # Auto-recovery: try clicking "Add to table" before accepting failure
             logger.info("Attempting auto-recovery: clicking 'Add to table' via JS...")
+
+            # Capture search count (import limit already set early in flow)
+            recovery_search_count = capture_search_count()
+
             add_js = """
                 let btns = document.querySelectorAll('button, a, [role="button"], [class*="button"]');
                 let found = null;
@@ -752,17 +1924,44 @@ Return ONLY a JSON object with one of these structures:
             add_res = run_agent_browser_command(["eval", add_js])
             logger.info(f"Auto-recovery result: {add_res}")
             if "Clicked" in add_res:
-                time.sleep(3)
-                logger.info("Auto-recovery succeeded: 'Add to table' clicked. Returning success.")
-                return True
+                logger.info("Auto-recovery succeeded: 'Add to table' clicked. Waiting for import...")
+                import_result = wait_for_import_completion(recovery_search_count)
+                enrichment_result = trigger_enrichment(
+                    expected_count=recovery_search_count,
+                    import_result=import_result
+                )
+                _result = {
+                    "success": True,
+                    "profiles_triggered": enrichment_result.get("count", 0),
+                    "enrichment_started": enrichment_result.get("started", False),
+                    "import_rows": import_result.get("row_count", 0),
+                }
+                debug_state.record_turn(turn, snapshot_json[:500], action, "fail-recovered", None, _debug_ss_ok)
+                debug_state.complete_run(_result)
+                return _result
             else:
                 # Button not found — check if page already transitioned (button was clicked in a previous turn)
                 check_url = run_agent_browser_command(["get", "url"]).strip()
                 logger.info(f"Auto-recovery: button not found, checking URL: {check_url}")
                 if "find-people" not in check_url.lower() and "login" not in check_url.lower():
-                    logger.info("Page already transitioned away from filters — import likely completed.")
-                    return True
+                    logger.info("Page already transitioned — waiting for import with stabilization mode...")
+                    import_result = wait_for_import_completion(None)
+                    enrichment_result = trigger_enrichment(
+                        expected_count=None,
+                        import_result=import_result
+                    )
+                    _result = {
+                        "success": True,
+                        "profiles_triggered": enrichment_result.get("count", 0),
+                        "enrichment_started": enrichment_result.get("started", False),
+                        "import_rows": import_result.get("row_count", 0),
+                    }
+                    debug_state.record_turn(turn, snapshot_json[:500], action, "fail-page-transitioned", None, _debug_ss_ok)
+                    debug_state.complete_run(_result)
+                    return _result
                 logger.error("Auto-recovery failed: 'Add to table' button not found and page hasn't transitioned.")
+                debug_state.record_turn(turn, snapshot_json[:500], action, "fail-unrecoverable", action.get('reason'), _debug_ss_ok)
+                debug_state.fail_run(f"Agent Failure: {action.get('reason')}")
                 raise Exception(f"Agent Failure: {action.get('reason')}")
             
         elif action_type == "click":
@@ -787,6 +1986,11 @@ Return ONLY a JSON object with one of these structures:
                 run_agent_browser_command(["press", "Enter"]) 
                 time.sleep(1)
             
+        elif action_type == "wait":
+            wait_secs = min(action.get("seconds", 5), 15)  # Cap at 15 seconds
+            logger.info(f"Agent waiting {wait_secs}s: {action.get('reason', 'no reason')}")
+            time.sleep(wait_secs)
+
         elif action_type == "press":
             key = action.get("key", "Enter")
             res = run_agent_browser_command(["press", key])
@@ -843,48 +2047,73 @@ Return ONLY a JSON object with one of these structures:
 
         elif action_type == "type_and_enter":
             # Type text into a multi-select input then press Enter to create a pill.
-            # If value contains commas, split and enter each individually.
-            ph = action.get("placeholder")
+            # Uses snapshot -i to find the target input ref instead of broken `fill :focus`.
             val = action.get("value")
+            ph = action.get("placeholder", "")
 
-            # Split comma-separated values into individual entries
-            # But preserve city names like "San Francisco, CA" — don't split if any part is ≤3 chars
+            # Split comma-separated values if needed
             if "," in val:
                 parts = [v.strip() for v in val.split(",") if v.strip()]
                 if len(parts) > 1 and all(len(p) > 3 for p in parts):
-                    values = parts  # All parts substantive → split (e.g., "VP of Sales, Head of Sales")
+                    values = parts
                 else:
-                    values = [val]  # Short part detected → keep as-is (e.g., "San Francisco, CA")
+                    values = [val]
             else:
                 values = [val]
-            logger.info(f"type_and_enter: {len(values)} value(s) to enter for placeholder '{ph}'")
+            logger.info(f"type_and_enter: {len(values)} value(s) to enter")
 
+            snap = run_agent_browser_command(["snapshot", "-i"])
             any_error = None
             for i, single_val in enumerate(values):
-                # Focus the input (first time by placeholder, subsequent by :focus fallback)
-                if ph and i == 0:
-                    focus_res = focus_input_by_text(ph)
-                    if "Element not found" in focus_res:
-                        logger.info(f"Placeholder '{ph}' not found, trying fill :focus directly")
-                elif ph and i > 0:
-                    # After first pill, placeholder may disappear — re-focus
-                    focus_res = focus_input_by_text(ph)
-                    if "Element not found" in focus_res:
-                        logger.info(f"Placeholder gone after pill {i}, using :focus fallback")
+                # Find the target input via snapshot -i
+                input_ref = None
 
-                time.sleep(0.3)
-                res = run_agent_browser_command(["fill", ":focus", single_val])
+                # Strategy 1: find expanded combobox (indicates active input)
+                for line in snap.split('\n'):
+                    if ('combobox' in line.lower() or 'textbox' in line.lower()) and '[ref=' in line:
+                        if '[expanded]' in line:
+                            parts = line.split('[ref=')
+                            if len(parts) > 1:
+                                input_ref = parts[1].split(']')[0]
+                                break
 
-                if res.startswith("Error:"):
-                    any_error = res
-                    logger.warning(f"Type (Fill) failed for '{single_val}': {res}")
-                    break
-                else:
+                # Strategy 2: use placeholder text from action
+                if not input_ref and ph:
+                    input_ref = parse_ref(snap, ph)
+
+                # Strategy 3: find unlabeled combobox not matching known sections
+                if not input_ref:
+                    for line in snap.split('\n'):
+                        if 'combobox' in line.lower() and '[ref=' in line:
+                            if not any(kw in line.lower() for kw in ['seniority', 'function', 'cities', 'countries', 'regions', 'states']):
+                                parts = line.split('[ref=')
+                                if len(parts) > 1:
+                                    input_ref = parts[1].split(']')[0]
+                                    break
+
+                if input_ref:
+                    res = run_agent_browser_command(["fill", f"@{input_ref}", single_val])
+                    if res and res.startswith("Error:"):
+                        any_error = res
+                        logger.warning(f"Type (Fill) failed for '{single_val}': {res}")
+                        break
+                    time.sleep(1)
                     run_agent_browser_command(["press", "Enter"])
                     time.sleep(1)
-                    run_agent_browser_command(["press", "Enter"])  # Double enter for Clay pills
+                    run_agent_browser_command(["press", "Escape"])
                     time.sleep(0.5)
+                    snap = run_agent_browser_command(["snapshot", "-i"])
                     logger.info(f"Pill {i+1}/{len(values)} entered: '{single_val}'")
+                else:
+                    # Fallback: JS execCommand on active element
+                    safe_val = single_val.replace("'", "\\'")
+                    run_agent_browser_command(["eval",
+                        f"document.activeElement && document.execCommand('insertText', false, '{safe_val}')"])
+                    time.sleep(0.5)
+                    run_agent_browser_command(["press", "Enter"])
+                    time.sleep(1)
+                    snap = run_agent_browser_command(["snapshot", "-i"])
+                    logger.info(f"Pill {i+1}/{len(values)} entered via JS fallback: '{single_val}'")
 
             if any_error:
                 last_error = any_error
@@ -892,6 +2121,12 @@ Return ONLY a JSON object with one of these structures:
         elif action_type == "click_by_text":
             # Click a button/link by its visible text content using JS (case-insensitive).
             btn_text = action.get("text", "")
+
+            # PRE-CLICK: Capture search count before page transitions (limit already set early)
+            expected_search_count = None
+            if "add to table" in btn_text.lower():
+                expected_search_count = capture_search_count()
+
             safe_text = btn_text.replace('"', '\\"').lower()
             click_js = f"""
                 let btns = document.querySelectorAll('button, a, [role="button"], [class*="button"]');
@@ -930,16 +2165,26 @@ Return ONLY a JSON object with one of these structures:
                 # Auto-complete: if we just clicked "Add to table", the import is triggered
                 if "add to table" in btn_text.lower():
                     logger.info("'Add to table' clicked successfully — import triggered.")
-                    time.sleep(3)  # Wait for page transition to table view
 
-                    # NEW: Trigger enrichment
-                    enrichment_result = trigger_enrichment()
+                    # Wait for profiles to finish importing into the table
+                    import_result = wait_for_import_completion(expected_search_count)
 
-                    return {
+                    # Trigger enrichment after import is verified
+                    enrichment_result = trigger_enrichment(
+                        expected_count=expected_search_count,
+                        import_result=import_result
+                    )
+
+                    _result = {
                         "success": True,
                         "profiles_triggered": enrichment_result.get("count", 0),
-                        "enrichment_started": enrichment_result.get("started", False)
+                        "enrichment_started": enrichment_result.get("started", False),
+                        "import_rows": import_result.get("row_count", 0),
+                        "import_matched": import_result.get("matched", False),
                     }
+                    debug_state.record_turn(turn, snapshot_json[:500], action, "add-to-table", None, _debug_ss_ok)
+                    debug_state.complete_run(_result)
+                    return _result
 
         elif action_type == "scroll":
             direction = action.get("direction", "down")
@@ -960,6 +2205,17 @@ Return ONLY a JSON object with one of these structures:
         else:
             logger.warning(f"Unknown action type: {action_type}")
             last_error = f"Unknown action type: {action_type}"
-            
+
+        # Debug: record this turn's outcome
+        debug_state.record_turn(
+            turn=turn,
+            snapshot_preview=snapshot_json[:500] if snapshot_json else "",
+            action=action,
+            action_result=last_error if last_error else "success",
+            error=last_error,
+            has_screenshot=_debug_ss_ok,
+        )
+
     logger.warning("Max turns reached without completion.")
+    debug_state.fail_run("Timeout: Max turns reached")
     raise Exception("Timeout: Max turns reached")

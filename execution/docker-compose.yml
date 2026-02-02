@@ -1,0 +1,11 @@
+services:
+  clay-auto:
+    build: .
+    container_name: clay-auto
+    restart: always
+    mem_limit: 8g
+    shm_size: 2gb
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env

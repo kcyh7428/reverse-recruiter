@@ -1671,72 +1671,63 @@ def update_record_id_column(record_id: str) -> Dict[str, Any]:
                 _take_filter_screenshot("recordid_03_input_FAILED")
                 return {"success": False, "record_id": record_id, "error": "Text input not found in edit panel (all 6 strategies failed)"}
 
-        # Step 4: Replace text in the contenteditable editor
+        # Step 4: Replace text in the contenteditable editor via direct DOM query.
         # Clay uses a rich text editor (contenteditable div), NOT a native <input>.
-        # Playwright's `fill` command silently fails on contenteditable elements.
-        # Must use JavaScript execCommand instead.
+        # Playwright's `fill` silently fails on contenteditable.
+        # document.activeElement is unreliable across separate subprocess calls.
+        # Solution: single eval that finds the element via querySelectorAll, focuses, and replaces.
         if not used_js_fallback:
-            logger.info(f"{LOG} Step 4: Replacing text with '{record_id}' in {input_ref}...")
+            logger.info(f"{LOG} Step 4: Replacing text with '{record_id}'...")
 
-            # Click the input ref to focus the contenteditable element
-            run_agent_browser_command(["click", input_ref])
-            time.sleep(0.5)
-
-            # Use JavaScript to select all text and replace with record_id
-            # execCommand('insertText') is the correct API for contenteditable
             js_replace = f"""(() => {{
-                const el = document.activeElement;
-                if (el && (el.isContentEditable || el.tagName === 'TEXTAREA' || el.tagName === 'INPUT')) {{
-                    if (el.isContentEditable) {{
+                // Find contenteditable elements in the right-side edit panel
+                const editables = document.querySelectorAll('[contenteditable="true"]');
+                for (const el of editables) {{
+                    const rect = el.getBoundingClientRect();
+                    // Edit panel is on the right half of the screen, element should be reasonably sized
+                    if (rect.width > 50 && rect.right > window.innerWidth / 2) {{
+                        el.focus();
                         document.execCommand('selectAll', false, null);
                         document.execCommand('insertText', false, '{record_id}');
-                    }} else {{
-                        el.select();
-                        el.value = '{record_id}';
-                        el.dispatchEvent(new Event('input', {{bubbles: true}}));
+                        return JSON.stringify({{
+                            success: true,
+                            tag: el.tagName,
+                            text: el.textContent.substring(0, 30),
+                            rect: [Math.round(rect.x), Math.round(rect.y), Math.round(rect.width), Math.round(rect.height)]
+                        }});
                     }}
-                    return JSON.stringify({{success: true, tag: el.tagName, editable: el.isContentEditable}});
                 }}
-                return JSON.stringify({{success: false, tag: document.activeElement?.tagName}});
+                // Debug: report what contenteditable elements exist
+                const info = [...editables].map(e => {{
+                    const r = e.getBoundingClientRect();
+                    return {{tag: e.tagName, w: Math.round(r.width), r: Math.round(r.right), text: e.textContent.substring(0, 20)}};
+                }});
+                return JSON.stringify({{success: false, editables: info}});
             }})()"""
+
             js_result = run_agent_browser_command(["eval", js_replace])
-            logger.info(f"{LOG} JS replace result: {js_result}")
+            logger.info(f"{LOG} JS fill result: {js_result}")
 
             time.sleep(1)
-
-            # Verify: take snapshot and check new value appears
-            verify_snap = run_agent_browser_command(["snapshot"]) or ""
-            if record_id[:8] in verify_snap:
-                logger.info(f"{LOG} Verified: '{record_id[:8]}...' found in snapshot after fill")
-            else:
-                logger.warning(f"{LOG} Could not verify record_id in snapshot — trying keyboard fallback")
-                # Last resort: Ctrl+A and type character by character
-                run_agent_browser_command(["click", input_ref])
-                time.sleep(0.3)
-                run_agent_browser_command(["press", "Control+a"])
-                time.sleep(0.2)
-                run_agent_browser_command(["press", "Backspace"])
-                time.sleep(0.2)
-                for char in record_id:
-                    run_agent_browser_command(["press", char])
-                    time.sleep(0.05)
-                logger.info(f"{LOG} Typed record_id via keyboard as last resort")
-
             _take_filter_screenshot("recordid_03_filled")
 
-        # Step 5: Click "Save and don't run enrichments" button to apply value
-        # (Pressing Escape might not save the value)
-        logger.info(f"{LOG} Step 5: Clicking 'Save and don't run enrichments'...")
+            # Verify the new value appears in the page
+            verify_snap = run_agent_browser_command(["snapshot"]) or ""
+            if record_id[:8] in verify_snap:
+                logger.info(f"{LOG} Verified: '{record_id[:8]}...' found in snapshot")
+            else:
+                logger.warning(f"{LOG} Verification failed — record_id not found in snapshot")
+                for i, line in enumerate(verify_snap.split('\n')):
+                    if 'rec' in line.lower() or 'edit' in line.lower():
+                        logger.info(f"{LOG} Verify diag[{i}]: {line.strip()[:120]}")
+
+        # Step 5: Click "Save" button to apply value and run enrichments
+        logger.info(f"{LOG} Step 5: Clicking 'Save' button...")
         time.sleep(1)
 
         save_clicked, _, _ = _find_and_click_snapshot(
-            "Save and don't run", max_retries=2, log_prefix=LOG
+            'Save', exclude_text="don't", max_retries=3, log_prefix=LOG
         )
-        if not save_clicked:
-            # Fall back to just "Save" button
-            save_clicked, _, _ = _find_and_click_snapshot(
-                'Save', exclude_text='don', max_retries=2, log_prefix=LOG
-            )
         if not save_clicked:
             # Last resort: press Escape and hope the value was auto-saved
             logger.warning(f"{LOG} Could not find Save button, pressing Escape as fallback")

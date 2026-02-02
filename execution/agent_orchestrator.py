@@ -1538,79 +1538,85 @@ def update_record_id_column(record_id: str) -> Dict[str, Any]:
 
         input_ref = None
         used_js_fallback = False
-        role_keywords = ['textbox', 'input', 'combobox', 'editor']
-        skip_keywords = ['search', 'data type', 'column name', 'rename']
 
         # Search a snapshot string with multiple strategies
+        # Ordered from most specific to most general to avoid false positives
+        # (e.g., the "Data type: Text" combobox was previously matched instead of the text input)
         for snap_label, snap in [("snap-i", snap_i), ("snap-reg", snap_r)]:
             if input_ref:
                 break
             lines = snap.split('\n')
 
-            # Strategy 1: placeholder text + input role on same line
-            for line in lines:
-                ll = line.lower()
-                if ('type /' in ll or 'insert column' in ll):
-                    if any(kw in ll for kw in role_keywords):
-                        refs = _extract_refs(line)
-                        if refs:
-                            input_ref = refs[0]
-                            logger.info(f"{LOG} {snap_label} S1 placeholder+role: {input_ref} | {line.strip()[:120]}")
-                            break
-            if input_ref:
-                break
-
-            # Strategy 2: any textbox/combobox/editor (skip irrelevant)
-            for line in lines:
-                ll = line.lower()
-                if any(kw in ll for kw in role_keywords):
-                    if any(skip in ll for skip in skip_keywords):
-                        continue
-                    refs = _extract_refs(line)
-                    if refs:
-                        input_ref = refs[0]
-                        logger.info(f"{LOG} {snap_label} S2 role-scan: {input_ref} | {line.strip()[:120]}")
-                        break
-            if input_ref:
-                break
-
-            # Strategy 3: textarea / contenteditable
-            for line in lines:
-                ll = line.lower()
-                if 'textarea' in ll or 'contenteditable' in ll:
-                    refs = _extract_refs(line)
-                    if refs:
-                        input_ref = refs[0]
-                        logger.info(f"{LOG} {snap_label} S3 textarea: {input_ref} | {line.strip()[:120]}")
-                        break
-            if input_ref:
-                break
-
-            # Strategy 4: proximity - find "Type /" line, look at preceding lines for refs
-            type_line_idx = None
-            for i, line in enumerate(lines):
-                if 'type /' in line.lower() or 'insert column' in line.lower():
-                    type_line_idx = i
-                    break
-            if type_line_idx is not None:
-                # Search 15 lines before "Type /" for the nearest ref
-                for j in range(type_line_idx - 1, max(-1, type_line_idx - 16), -1):
-                    refs = _extract_refs(lines[j])
-                    if refs:
-                        input_ref = refs[-1]  # Last ref on line = deepest element
-                        logger.info(f"{LOG} {snap_label} S4 proximity: {input_ref} at line {j}: {lines[j].strip()[:120]}")
-                        break
-            if input_ref:
-                break
-
-            # Strategy 5: line containing existing record ID value (starts with 'rec')
+            # Strategy 1 (BEST): Line containing existing record ID value
+            # The text area already has a recXXX value from previous use
             for line in lines:
                 ll = line.lower()
                 if re.search(r'\brec[a-z0-9]{8,}', ll):
                     refs = _extract_refs(line)
                     if refs:
                         input_ref = refs[0]
-                        logger.info(f"{LOG} {snap_label} S5 existing-recID: {input_ref} | {line.strip()[:120]}")
+                        logger.info(f"{LOG} {snap_label} S1 existing-recID: {input_ref} | {line.strip()[:120]}")
+                        break
+            if input_ref:
+                break
+
+            # Strategy 2: Proximity - find "Type /" placeholder, look at preceding lines for refs
+            # The "Type / to Insert column" text is inside/below the input area
+            type_line_idx = None
+            for i, line in enumerate(lines):
+                if 'type /' in line.lower() or 'insert column' in line.lower():
+                    type_line_idx = i
+                    break
+            if type_line_idx is not None:
+                # Search lines before "Type /" for the nearest ref (walk backwards)
+                for j in range(type_line_idx - 1, max(-1, type_line_idx - 16), -1):
+                    line_lower = lines[j].lower()
+                    # Skip refs that are clearly NOT the text input
+                    if any(skip in line_lower for skip in ['data type', 'search', 'rename', 'checkbox', 'number', 'url']):
+                        continue
+                    refs = _extract_refs(lines[j])
+                    if refs:
+                        input_ref = refs[-1]  # Last ref on line = deepest element
+                        logger.info(f"{LOG} {snap_label} S2 proximity: {input_ref} at line {j}: {lines[j].strip()[:120]}")
+                        break
+            if input_ref:
+                break
+
+            # Strategy 3: placeholder text + input role on same line
+            for line in lines:
+                ll = line.lower()
+                if ('type /' in ll or 'insert column' in ll):
+                    if any(kw in ll for kw in ['textbox', 'input', 'combobox', 'editor']):
+                        refs = _extract_refs(line)
+                        if refs:
+                            input_ref = refs[0]
+                            logger.info(f"{LOG} {snap_label} S3 placeholder+role: {input_ref} | {line.strip()[:120]}")
+                            break
+            if input_ref:
+                break
+
+            # Strategy 4: textbox or editor only (NO combobox - those are dropdowns like "Data type: Text")
+            for line in lines:
+                ll = line.lower()
+                if 'textbox' in ll or 'editor' in ll:
+                    if any(skip in ll for skip in ['search', 'data type', 'column name', 'rename', 'find people']):
+                        continue
+                    refs = _extract_refs(line)
+                    if refs:
+                        input_ref = refs[0]
+                        logger.info(f"{LOG} {snap_label} S4 role-scan: {input_ref} | {line.strip()[:120]}")
+                        break
+            if input_ref:
+                break
+
+            # Strategy 5: textarea / contenteditable
+            for line in lines:
+                ll = line.lower()
+                if 'textarea' in ll or 'contenteditable' in ll:
+                    refs = _extract_refs(line)
+                    if refs:
+                        input_ref = refs[0]
+                        logger.info(f"{LOG} {snap_label} S5 textarea: {input_ref} | {line.strip()[:120]}")
                         break
 
         # Strategy 6 (JavaScript fallback): directly find and fill via DOM
@@ -1748,6 +1754,13 @@ def trigger_enrichment(expected_count=None, import_result=None) -> Dict[str, Any
     logger.info(f"[ENRICHMENT] Starting enrichment trigger sequence... (import_rows={import_rows})")
 
     try:
+        # Cleanup: dismiss any open panels/dropdowns from prior steps (e.g., RecordID edit panel)
+        logger.info("[ENRICHMENT] Cleanup: pressing Escape to dismiss any open panels...")
+        run_agent_browser_command(["press", "Escape"])
+        time.sleep(1)
+        run_agent_browser_command(["press", "Escape"])
+        time.sleep(1)
+
         # ================================================================
         # Step 1: Click "Create Profile" column header to open dropdown
         # Using agent-browser native click (Playwright) for proper React event handling

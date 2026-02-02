@@ -1231,15 +1231,28 @@ def wait_for_import_completion(expected_count) -> Dict[str, Any]:
     # This is much more reliable than counting DOM elements (Clay uses virtual scrolling).
     count_js = """
     (function() {
-        // Strategy 1: Find "X/Y" row count pattern in the page (Clay table header shows this)
-        // Example: "49,935/49,935" or "100/100"
+        // Strategy 1: Find ALL "X/Y" patterns in the page.
+        // Clay header shows "22/23" (columns) THEN "65/65" (rows).
+        // We need the ROW count, which has the highest denominator.
         let bodyText = document.body.innerText;
-        let rowCountMatch = bodyText.match(/(\\d[\\d,]*)\\/(\\d[\\d,]*)/);
-        if (rowCountMatch) {
-            let current = parseInt(rowCountMatch[1].replace(/,/g, ''));
-            let total = parseInt(rowCountMatch[2].replace(/,/g, ''));
-            if (current > 0 && total > 0) {
-                return JSON.stringify({"count": current, "total": total, "source": "row_counter_text", "match": rowCountMatch[0]});
+        let allMatches = [...bodyText.matchAll(/(\\d[\\d,]*)\\/(\\d[\\d,]*)/g)];
+        if (allMatches.length > 0) {
+            // Pick the match with the highest denominator (row count > column count)
+            let best = null;
+            let bestTotal = 0;
+            for (let m of allMatches) {
+                let current = parseInt(m[1].replace(/,/g, ''));
+                let total = parseInt(m[2].replace(/,/g, ''));
+                if (total > bestTotal && current > 0 && total > 0) {
+                    best = m;
+                    bestTotal = total;
+                }
+            }
+            if (best) {
+                let current = parseInt(best[1].replace(/,/g, ''));
+                let total = parseInt(best[2].replace(/,/g, ''));
+                let allStr = allMatches.map(m => m[0]).join(', ');
+                return JSON.stringify({"count": current, "total": total, "source": "row_counter_text", "match": best[0], "all_matches": allStr});
             }
         }
 
@@ -1275,21 +1288,26 @@ def wait_for_import_completion(expected_count) -> Dict[str, Any]:
             data = parse_js_json(result)
             current_count = data.get("count", 0)
             source = data.get("source", "unknown")
+            all_matches = data.get("all_matches", "")
         except (json.JSONDecodeError, TypeError):
             current_count = 0
             source = "parse_error"
+            all_matches = ""
 
         logger.info(
             f"[IMPORT] Poll: {current_count}/{expected_count or '?'} rows "
-            f"(elapsed={elapsed}s, source={source})"
+            f"(elapsed={elapsed}s, source={source}, all_xy=[{all_matches}])"
         )
 
         # Check completion: count_match mode
         if mode == "count_match" and current_count >= expected_count:
             logger.info(
                 f"[IMPORT] Import complete! Row count ({current_count}) matches "
-                f"expected ({expected_count}). Elapsed: {elapsed}s"
+                f"expected ({expected_count}). Elapsed: {elapsed}s. "
+                f"Waiting 10s for UI to settle before enrichment..."
             )
+            _take_filter_screenshot("import_complete")
+            time.sleep(10)  # Let Clay's UI fully settle before any clicks
             return {"row_count": current_count, "matched": True, "timed_out": False}
 
         # Take screenshot when count changes (track import progress visually)
@@ -1477,15 +1495,31 @@ def trigger_enrichment(expected_count=None, import_result=None) -> Dict[str, Any
             return {"count": 0, "started": False, "error": "Run column not found in dropdown", "import_rows": import_rows}
 
         # ================================================================
-        # Step 3: Click "Run all X rows" from the submenu/dialog
+        # Step 3: Click "Run all X rows" / "Force run all X rows" from submenu
         # ================================================================
-        time.sleep(3)  # Wait for Run dialog to appear
-        logger.info("[ENRICHMENT] Step 3: Clicking 'Run all' from submenu...")
+        # Wait for submenu to fully load (it shows "Loading..." initially)
+        time.sleep(3)
+        logger.info("[ENRICHMENT] Step 3: Waiting for submenu to load...")
+        for _wait in range(5):
+            snap_text = run_agent_browser_command(["snapshot"]) or ""
+            if "loading" not in snap_text.lower() or "force run" in snap_text.lower() or "run all" in snap_text.lower():
+                break
+            logger.info("[ENRICHMENT] Submenu still loading, waiting 2s...")
+            time.sleep(2)
+        time.sleep(1)  # Extra 1s for rendering
 
-        # Try "Run all" first
+        logger.info("[ENRICHMENT] Step 3: Clicking 'Force run all' / 'Run all' from submenu...")
+
+        # Try "Force run all" first (Clay shows this in column dropdown submenu)
         run_all_clicked, run_all_result, run_all_line = _find_and_click_snapshot(
-            'Run all', max_retries=3
+            'Force run all', max_retries=2
         )
+        if not run_all_clicked:
+            # Fallback to "Run all"
+            logger.info("[ENRICHMENT] 'Force run all' not found, trying 'Run all'...")
+            run_all_clicked, run_all_result, run_all_line = _find_and_click_snapshot(
+                'Run all', max_retries=2
+            )
 
         # Extract count from the matched line
         count = 0

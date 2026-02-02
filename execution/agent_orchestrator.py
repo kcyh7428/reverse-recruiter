@@ -1215,7 +1215,7 @@ def wait_for_import_completion(expected_count) -> Dict[str, Any]:
     Returns:
         dict: {"row_count": int, "matched": bool, "timed_out": bool}
     """
-    MAX_WAIT_SECONDS = 300   # 5 minutes max
+    MAX_WAIT_SECONDS = 360   # 6 minutes max (large imports need time)
     POLL_INTERVAL = 10       # seconds between polls
     STABILIZE_CHECKS = 3     # consecutive unchanged counts = done
     INITIAL_WAIT = 10        # initial wait for page transition
@@ -1292,6 +1292,10 @@ def wait_for_import_completion(expected_count) -> Dict[str, Any]:
             )
             return {"row_count": current_count, "matched": True, "timed_out": False}
 
+        # Take screenshot when count changes (track import progress visually)
+        if current_count != last_count and current_count > 0:
+            _take_filter_screenshot(f"import_poll_{current_count}")
+
         # Stabilization tracking (applies to BOTH modes)
         if current_count == last_count and current_count > 0:
             stable_streak += 1
@@ -1302,13 +1306,24 @@ def wait_for_import_completion(expected_count) -> Dict[str, Any]:
         # Stabilization check (works in both count_match and stabilization modes)
         # If count has been stable for N consecutive checks, import is likely done
         if stable_streak >= STABILIZE_CHECKS and current_count > 0:
-            matched = (mode == "count_match" and current_count >= expected_count)
-            logger.info(
-                f"[IMPORT] Import stabilized at {current_count} rows "
-                f"after {STABILIZE_CHECKS} consecutive checks. "
-                f"Elapsed: {elapsed}s, matched={matched}"
-            )
-            return {"row_count": current_count, "matched": matched, "timed_out": False}
+            if mode == "count_match" and current_count < expected_count:
+                # Still below expected — don't exit early, keep waiting
+                logger.warning(
+                    f"[IMPORT] Count stable at {current_count} but expected {expected_count}. "
+                    f"Resetting streak, will keep polling up to {MAX_WAIT_SECONDS}s..."
+                )
+                _take_filter_screenshot(f"import_stalled_{current_count}_of_{expected_count}")
+                stable_streak = 0  # Reset to keep polling
+            else:
+                # Either no expected count (stabilization mode), or we've met/exceeded it
+                matched = (mode == "count_match" and current_count >= expected_count)
+                logger.info(
+                    f"[IMPORT] Import stabilized at {current_count} rows "
+                    f"after {STABILIZE_CHECKS} consecutive checks. "
+                    f"Elapsed: {elapsed}s, matched={matched}"
+                )
+                _take_filter_screenshot("import_complete")
+                return {"row_count": current_count, "matched": matched, "timed_out": False}
 
         last_count = current_count
         time.sleep(POLL_INTERVAL)
@@ -1319,6 +1334,7 @@ def wait_for_import_completion(expected_count) -> Dict[str, Any]:
         f"[IMPORT] Timeout after {MAX_WAIT_SECONDS}s. "
         f"Current rows: {last_count}, expected: {expected_count or '?'}. Proceeding anyway."
     )
+    _take_filter_screenshot(f"import_timeout_{last_count}")
     return {"row_count": last_count, "matched": False, "timed_out": True}
 
 
@@ -1427,8 +1443,11 @@ def trigger_enrichment(expected_count=None, import_result=None) -> Dict[str, Any
             'Create Profile', exclude_text='Click to run', max_retries=3
         )
 
+        _take_filter_screenshot("enrichment_01_header_click")
+
         if not header_clicked:
             logger.error("[ENRICHMENT] Failed to find/click 'Create Profile' column header")
+            _take_filter_screenshot("enrichment_01_header_FAILED")
             return {"count": 0, "started": False, "error": "Column header not found", "import_rows": import_rows}
 
         # ================================================================
@@ -1450,8 +1469,11 @@ def trigger_enrichment(expected_count=None, import_result=None) -> Dict[str, Any
                 'Run column', max_retries=2
             )
 
+        _take_filter_screenshot("enrichment_02_run_column")
+
         if not run_col_clicked:
             logger.error("[ENRICHMENT] Failed to find/click 'Run column' in dropdown")
+            _take_filter_screenshot("enrichment_02_run_column_FAILED")
             return {"count": 0, "started": False, "error": "Run column not found in dropdown", "import_rows": import_rows}
 
         # ================================================================
@@ -1496,6 +1518,7 @@ def trigger_enrichment(expected_count=None, import_result=None) -> Dict[str, Any
                 )
 
             time.sleep(3)
+            _take_filter_screenshot("enrichment_03_run_all")
             return {"count": count, "started": True, "import_rows": import_rows}
 
         # If "Run all" not found, check if there's a different text pattern
@@ -1515,6 +1538,7 @@ def trigger_enrichment(expected_count=None, import_result=None) -> Dict[str, Any
                 count = expected_count
             logger.info(f"[ENRICHMENT] Alt pattern triggered enrichment for {count} profiles")
             time.sleep(3)
+            _take_filter_screenshot("enrichment_03_run_all_alt")
             return {"count": count, "started": True, "import_rows": import_rows}
 
         # Log diagnostic snapshot for debugging

@@ -133,10 +133,6 @@ Analyze what went wrong and suggest adjustments:
    }
    ```
 
-3. **Clear the Bad Import (Optional):**
-   - If profiles are clearly wrong, may need to delete them before retry
-   - Or leave them and note that deduplication will handle on retry
-
 ## Element Reference Patterns
 
 ### Clay Table - Column Headers

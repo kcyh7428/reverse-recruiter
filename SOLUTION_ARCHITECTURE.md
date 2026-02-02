@@ -30,18 +30,19 @@ Reverse Recruiter is an **AI-powered recruiting automation system**. It takes jo
 2. The system is triggered via an HTTP request to the VPS
 3. **OpenAI GPT-4o** reads the raw job seeker data and optimizes it (e.g., consolidates 10 locations down to 3, picks the top 5 job titles)
 4. The **Agent Browser CLI** (Playwright-based) opens Clay.com in a real Chromium browser
-5. GPT-4o acts as the "brain" — it sees a snapshot of the page, decides what to click/type, and issues commands
-6. The browser fills in all Clay search filters (titles, locations, seniority, industries)
-7. Profiles are imported into the Clay table
-8. Airtable status is updated to "Ready to Launch"
+5. **Deterministic filter pipeline** (`apply_filters_deterministic()`) fills in all Clay search filters — seniority pills, job title pills, exclusion titles, country autocomplete, city pills, and limit. Per-step screenshots are saved for debugging.
+6. "Add to table" click imports profiles; `wait_for_import_completion()` polls until row count matches expected
+7. `update_record_id_column()` sets the JobSeeker RecordID on all imported rows (links profiles to the Airtable record)
+8. `trigger_enrichment()` clicks "Create Profile" → "Run all rows" to send profiles to the n8n webhook
+9. Airtable status is updated to "Ready to Launch"
 
 ### The 3-Layer Architecture
 
 | Layer | Purpose | Technology |
 |-------|---------|------------|
 | **Directives** | Markdown SOPs that define "what to do" step-by-step | `directives/clay_directive.md` |
-| **Orchestration** | AI decision-making loop that reads the page and acts | Python + OpenAI GPT-4o + Agent Browser CLI |
-| **Execution** | Deterministic utilities (login, cookies, Airtable API) | Python (Flask, pyairtable) |
+| **Orchestration** | GPT-4o interprets criteria; deterministic pipeline applies filters, imports, and triggers enrichment | Python + OpenAI GPT-4o + Agent Browser CLI |
+| **Execution** | Deterministic utilities (login, cookies, Airtable API, filter application) | Python (Flask, pyairtable) |
 
 ### External Services Used
 
@@ -59,18 +60,20 @@ Reverse Recruiter is an **AI-powered recruiting automation system**. It takes jo
 Reverse Recruiter/
 ├── execution/
 │   ├── main.py                  ← Flask web server (VPS entrypoint)
-│   ├── agent_orchestrator.py    ← Core automation loop (the "brain")
+│   ├── agent_orchestrator.py    ← Core automation loop (deterministic pipeline)
 │   ├── airtable_client.py       ← Reads/writes job seeker records
+│   ├── debug_state.py           ← Thread-safe debug state: screenshots, run history
 │   ├── Dockerfile               ← Container definition
 │   ├── requirements.txt         ← Python dependencies
 │   ├── session_cookies.json     ← Clay login cookies
 │   ├── local_test.sh            ← Script to test locally with Docker
 │   └── execute_local.py         ← Run a single job seeker locally
+├── docker-compose.yml           ← Root compose file (used by Hostinger API deployment)
 ├── directives/
 │   └── clay_directive.md        ← Step-by-step instructions for the AI agent
 ├── .agent/skills/               ← Browser automation skill definitions
-├── AGENTS.md                    ← Architecture documentation
-└── VPS_SETUP.md                 ← Deployment commands & infrastructure reference
+├── CLAUDE.md                    ← Project documentation (single source of truth)
+└── SOLUTION_ARCHITECTURE.md     ← This file (infrastructure decisions & architecture)
 ```
 
 ---
@@ -82,33 +85,33 @@ Reverse Recruiter/
 | Component | Details |
 |-----------|---------|
 | **Platform** | Hostinger VPS (KVM4, bare metal Docker) |
+| **VM ID** | 1311295 |
 | **IP Address** | 72.62.253.226 |
 | **OS** | Ubuntu 24.04 |
 | **RAM** | 16 GB |
 | **Container Memory** | 8 GB limit |
 | **Container shm-size** | 2 GB |
 | **Container Name** | `clay-auto` |
-| **Build System** | Local Docker build on VPS |
+| **GitHub Repo** | `https://github.com/kcyh7428/reverse-recruiter` |
+| **Build System** | Hostinger API (`VPS_createNewProjectV1`) — clones GitHub, builds Docker, starts container |
 
 ### How Deployment Works
 
-From the local machine, a single script deploys the entire system:
+**Primary method: Hostinger API** (no SSH required)
 
 ```bash
-# Automated deploy (from local machine)
-./execution/deploy_vps.sh 72.62.253.226
+# 1. Commit and push to GitHub
+git add <files> && git commit -m "your message" && git push origin main
 
-# Or manual deploy (SSH into VPS)
-ssh root@72.62.253.226
-cd /root/reverse-recruiter && git pull origin main
-cd execution && docker build -t clay-automation .
-docker stop clay-auto && docker rm clay-auto
-docker run -d --name clay-auto --restart=always \
-  --memory=8g --shm-size=2gb \
-  -p 8080:8080 \
-  --env-file /root/reverse-recruiter/.env \
-  clay-automation
+# 2. Deploy via Hostinger MCP tools (from Claude Code)
+#    Call VPS_createNewProjectV1:
+#      virtualMachineId: 1311295
+#      project_name: "clay-automation"
+#      content: "https://github.com/kcyh7428/reverse-recruiter"
+#      environment: (env vars from execution/.env)
 ```
+
+**SSH fallback** (may hit rate limits): `./execution/deploy_vps.sh 72.62.253.226`
 
 ### Why Hostinger VPS
 

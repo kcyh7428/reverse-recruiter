@@ -101,15 +101,9 @@ RUN cd "$(npm root -g)/agent-browser" && npm install playwright-core@1.49.0
 
 ### 3.4 Agent Browser Skill File (Cole Style)
 
-The agent must be able to locate and read Agent Browser documentation. Create `skills/agent-browser/SKILL.md` with CLI command reference:
+The agent must be able to locate and read Agent Browser documentation. The skill file lives at `.agent/skills/agent-browser/SKILL.md`.
 
-```
-skills/
-└── agent-browser/
-    └── SKILL.md    # Contains CLI usage from GitHub repo --help
-```
-
-Add to your project or global `AGENTS.md`:
+Add to your project `CLAUDE.md`:
 
 ```markdown
 ## Browser Automation
@@ -262,9 +256,10 @@ sequenceDiagram
 ### 8.1 Required Reading Order
 
 1. **Read local docs first:**
-   - `UpdatedPRD.md` (this file)
+   - `PRD.md` (this file)
+   - `CLAUDE.md` (project documentation, single source of truth)
    - `execution/local_testing_guide.md` (Docker, OpenAI auth, Agent Browser install)
-   - `skills/agent-browser/SKILL.md` (CLI command reference)
+   - `.agent/skills/agent-browser/SKILL.md` (CLI command reference)
 
 2. **Read Agent Browser documentation:**
    - Visit `https://github.com/vercel-labs/agent-browser`
@@ -272,13 +267,13 @@ sequenceDiagram
 
 ### 8.2 Implementation Phases
 
-| Phase | Focus |
-|-------|-------|
-| Phase 1 | Airtable MCP/API integration (query and update job seeker records) |
-| Phase 2 | OpenAI GPT-4o integration and search-profile JSON design |
-| Phase 3 | Agent Browser integration (ensure CLI works inside Docker) |
-| Phase 4 | Clay UI automation via Agent Browser commands (FR-6 through FR-10) |
-| Phase 5 | End-to-end loop: Airtable → GPT-4o → Clay → destination → Airtable |
+| Phase | Focus | Status |
+|-------|-------|--------|
+| Phase 1 | Airtable MCP/API integration (query and update job seeker records) | Done |
+| Phase 2 | OpenAI GPT-4o integration and search-profile JSON design | Done |
+| Phase 3 | Agent Browser integration (ensure CLI works inside Docker) | Done |
+| Phase 4 | Clay UI automation via Agent Browser commands (FR-6 through FR-10) | Done |
+| Phase 5 | End-to-end loop: Airtable → GPT-4o → Clay → destination → Airtable | In Progress |
 
 ### 8.3 Key Principles (Cole's Approach)
 
@@ -310,17 +305,21 @@ agent-browser snapshot -i --json
 Reverse Recruiter/
 ├── execution/
 │   ├── main.py                    # Flask entry point
-│   ├── agent_orchestrator.py      # Agent loop logic
+│   ├── agent_orchestrator.py      # Core automation loop (deterministic pipeline)
 │   ├── airtable_client.py         # Airtable API client
+│   ├── debug_state.py             # Thread-safe debug state: screenshots, run history
 │   ├── local_testing_guide.md     # Docker & local setup
 │   ├── Dockerfile                 # Container definition
 │   └── session_cookies.json       # Clay session cookies
-├── skills/
-│   └── agent-browser/
-│       └── SKILL.md               # Agent Browser CLI reference
+├── .agent/skills/
+│   ├── agent-browser/SKILL.md     # Agent Browser CLI reference
+│   ├── clay-people-search/SKILL.md # Clay People Search automation
+│   ├── clay-profile-review-link/SKILL.md # Profile review & linkage
+│   └── clay-bulk-delete/SKILL.md  # Bulk row deletion
 ├── directives/
-│   └── clay_people_search.md      # Search directive template
-├── AGENTS.md                      # Agent instructions
-├── UpdatedPRD.md                  # This file
-└── PRD.md                         # Original PRD (reference)
+│   └── clay_directive.md          # Step-by-step instructions for the AI agent
+├── docker-compose.yml             # Root compose file (Hostinger API deployment)
+├── CLAUDE.md                      # Project documentation (single source of truth)
+├── SOLUTION_ARCHITECTURE.md       # Infrastructure decisions & architecture
+└── PRD.md                         # This file
 ```

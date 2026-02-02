@@ -119,6 +119,27 @@ Screenshots are taken at each filter step (`filter_01_seniority`, `filter_02_tit
 - **Stealth mode**: `--disable-blink-features=AutomationControlled` hides `navigator.webdriver` from Clay's bot detection.
 - **Hostinger deployment**: Always use GitHub push + `VPS_createNewProjectV1` API. Avoid SSH to prevent rate limiting.
 
+## Agent Operating Principles
+
+1. **Check for tools first** — Before writing a script, check `execution/` for existing tools per the directive. Only create new scripts if none exist.
+2. **Self-anneal when things break** — Read error message and stack trace → fix the script → test again → update the directive with what you learned (API limits, timing, edge cases).
+3. **Update directives as you learn** — Directives are living documents. When you discover API constraints, better approaches, or common errors, update the directive. Don't create or overwrite directives without asking.
+
+## Skills (Browser Automation)
+
+For complex, multi-step browser automation, use **Skills** (`.agent/skills/`) instead of writing inline code.
+
+| Skill | Purpose |
+|-------|---------|
+| `agent-browser` | CLI reference for web automation |
+| `clay-people-search` | Automate Clay's "Find People" search interface |
+| `clay-profile-review-link` | Review imported profiles and link to JobSeeker |
+| `clay-bulk-delete` | Clear all rows from Clay table |
+
+**When to use Skills vs Directives:**
+- **Skills**: Complex browser automation with many steps, element refs, error handling
+- **Directives**: Simple SOPs for manual processes, API integrations, data processing
+
 ## Testing Endpoints
 
 ```bash
@@ -127,4 +148,22 @@ curl http://72.62.253.226:8080/test-connectivity    # Browser can reach internet
 curl http://72.62.253.226:8080/test-clay-access     # Browser can reach Clay login
 curl http://72.62.253.226:8080/test-clay-auth       # Full auth flow works
 curl -X POST "http://72.62.253.226:8080/run-automation?record_id=recfV7X8d6XccguoL"  # Test record
+```
+
+## Server Maintenance
+
+```bash
+# Docker cleanup (reclaim disk space)
+docker system prune -f
+
+# View logs via SSH (fallback if Hostinger API logs insufficient)
+ssh root@72.62.253.226
+docker logs clay-auto -f
+docker logs clay-auto --since 1h
+
+# Container resource usage
+docker stats clay-auto --no-stream
+
+# Disk space
+df -h && docker system df
 ```

@@ -481,7 +481,7 @@ Return ONLY valid JSON (no markdown, no explanation):
         raise
 
 # Default import limit for Clay People Search
-IMPORT_LIMIT = 100
+IMPORT_LIMIT = 150
 
 def set_import_limit(limit: int = IMPORT_LIMIT) -> bool:
     """

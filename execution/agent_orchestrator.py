@@ -3,6 +3,7 @@ import subprocess
 import json
 import logging
 import time
+import re
 from typing import Dict, Any
 from tenacity import retry, stop_after_attempt, wait_exponential
 from openai import OpenAI
@@ -988,7 +989,7 @@ def wait_for_add_button_enabled(max_wait=90, poll_interval=5):
     return None, last_snap
 
 
-def click_add_to_table_deterministic():
+def click_add_to_table_deterministic(record_id=None):
     """
     Deterministically wait for and click the 'Add to table' button.
     Handles: loading state wait, confirmation dialogs, page transition verification.
@@ -1066,8 +1067,14 @@ def click_add_to_table_deterministic():
                 run_agent_browser_command(["screenshot", _post_ss])
             except Exception:
                 pass
-            # Import triggered — wait for rows and trigger enrichment
+            # Import triggered — wait for rows, update RecordID, trigger enrichment
             import_result = wait_for_import_completion(expected_count)
+
+            # Update JobSeeker RecordID column before triggering enrichment
+            if record_id:
+                recordid_result = update_record_id_column(record_id)
+                logger.info(f"[RECORDID] Update result: {json.dumps(recordid_result)}")
+
             enrichment_result = trigger_enrichment(
                 expected_count=expected_count,
                 import_result=import_result
@@ -1077,6 +1084,7 @@ def click_add_to_table_deterministic():
                 "profiles_triggered": enrichment_result.get("count", 0),
                 "enrichment_started": enrichment_result.get("started", False),
                 "import_rows": import_result.get("row_count", 0),
+                "record_id_set": record_id if record_id else None,
             }
 
     # Page didn't transition — check if button is gone (import may have happened inline)
@@ -1085,6 +1093,12 @@ def click_add_to_table_deterministic():
     if "add to table" not in snap.lower():
         logger.info("[IMPORT] 'Add to table' button gone — import may have triggered inline")
         import_result = wait_for_import_completion(expected_count)
+
+        # Update JobSeeker RecordID column before triggering enrichment
+        if record_id:
+            recordid_result = update_record_id_column(record_id)
+            logger.info(f"[RECORDID] Update result: {json.dumps(recordid_result)}")
+
         enrichment_result = trigger_enrichment(
             expected_count=expected_count,
             import_result=import_result
@@ -1094,6 +1108,7 @@ def click_add_to_table_deterministic():
             "profiles_triggered": enrichment_result.get("count", 0),
             "enrichment_started": enrichment_result.get("started", False),
             "import_rows": import_result.get("row_count", 0),
+            "record_id_set": record_id if record_id else None,
         }
 
     logger.warning("[IMPORT] Import may not have triggered — falling back to GPT-4o")
@@ -1356,6 +1371,248 @@ def wait_for_import_completion(expected_count) -> Dict[str, Any]:
     return {"row_count": last_count, "matched": False, "timed_out": True}
 
 
+# ============================================================================
+# Shared helpers for snapshot-based element finding and clicking
+# ============================================================================
+
+def _extract_refs(line_text):
+    """Extract element refs from snapshot line. Handles both @eXX and [ref=eXX] formats."""
+    ref_matches = re.findall(r'\[ref=(e\d+)\]', line_text)
+    if ref_matches:
+        return ['@' + r for r in ref_matches]
+    at_matches = re.findall(r'(@e\d+)', line_text)
+    return at_matches
+
+
+def _find_and_click_snapshot(search_text, exclude_text=None, max_retries=3, log_prefix="[UI]"):
+    """
+    Use agent-browser snapshot to find element by text, then native click.
+    Native clicks properly trigger React event handlers (unlike JS DOM clicks).
+    Returns (success: bool, click_result: str, matched_line: str)
+    """
+    search_lower = search_text.lower()
+    exclude_lower = exclude_text.lower() if exclude_text else None
+
+    for attempt in range(max_retries):
+        snapshot_text = run_agent_browser_command(["snapshot"])
+        if not snapshot_text:
+            time.sleep(2)
+            continue
+
+        lines = snapshot_text.split('\n')
+
+        # Log snapshot diagnostics on first attempt
+        if attempt == 0:
+            logger.info(f"{log_prefix} Snapshot: {len(lines)} lines, {len(snapshot_text)} chars")
+
+        # Search with case-insensitive matching
+        for i, line in enumerate(lines):
+            line_lower = line.lower()
+            if search_lower in line_lower:
+                if exclude_lower and exclude_lower in line_lower:
+                    continue
+                refs = _extract_refs(line)
+                if refs:
+                    logger.info(f"{log_prefix} Found '{search_text}' at line {i}: {line.strip()[:120]}, refs={refs}")
+                    for ref in refs:
+                        click_result = run_agent_browser_command(["click", ref])
+                        logger.info(f"{log_prefix} Native click {ref}: {click_result}")
+                        if click_result and "error" not in str(click_result).lower():
+                            return True, click_result, line.strip()
+                        time.sleep(1)
+
+        # Also try matching individual words (handles split text across elements)
+        if ' ' in search_text:
+            words = search_text.split()
+            for i, line in enumerate(lines):
+                line_lower = line.lower()
+                if all(w.lower() in line_lower for w in words):
+                    if exclude_lower and exclude_lower in line_lower:
+                        continue
+                    refs = _extract_refs(line)
+                    if refs:
+                        logger.info(f"{log_prefix} Found '{search_text}' (word match) at line {i}: {line.strip()[:120]}, refs={refs}")
+                        for ref in refs:
+                            click_result = run_agent_browser_command(["click", ref])
+                            logger.info(f"{log_prefix} Native click {ref}: {click_result}")
+                            if click_result and "error" not in str(click_result).lower():
+                                return True, click_result, line.strip()
+                            time.sleep(1)
+
+        if attempt < max_retries - 1:
+            logger.info(f"{log_prefix} '{search_text}' not found in snapshot, retrying ({attempt + 1}/{max_retries})...")
+            time.sleep(3)
+
+    return False, None, None
+
+
+def _find_ref_in_snapshot(search_text, exclude_text=None, log_prefix="[UI]"):
+    """
+    Find an element ref by text in the current snapshot WITHOUT clicking it.
+    Returns the ref string (e.g., '@e5') or None.
+    """
+    snapshot_text = run_agent_browser_command(["snapshot"])
+    if not snapshot_text:
+        return None
+
+    search_lower = search_text.lower()
+    exclude_lower = exclude_text.lower() if exclude_text else None
+
+    for line in snapshot_text.split('\n'):
+        line_lower = line.lower()
+        if search_lower in line_lower:
+            if exclude_lower and exclude_lower in line_lower:
+                continue
+            refs = _extract_refs(line)
+            if refs:
+                logger.info(f"{log_prefix} Found ref for '{search_text}': {refs[0]} in: {line.strip()[:120]}")
+                return refs[0]
+    return None
+
+
+def update_record_id_column(record_id: str) -> Dict[str, Any]:
+    """
+    Edit the 'JobSeeker RecordID' column to set the record ID for all rows.
+    Must be done BEFORE triggering 'Create Profile' enrichment so the webhook
+    knows which JobSeeker the profiles belong to.
+
+    Clay UI flow:
+    1. Click "JobSeeker RecordID" column header → dropdown opens
+    2. Click "Edit column" from dropdown → edit panel opens on right
+    3. Find text input in edit panel
+    4. Clear existing value, fill with record_id
+    5. Press Escape to close edit panel
+
+    Returns:
+        dict: {"success": bool, "record_id": str, "error": str (optional)}
+    """
+    LOG = "[RECORDID]"
+    logger.info(f"{LOG} Setting JobSeeker RecordID column to '{record_id}'...")
+
+    try:
+        # Step 1: Click "JobSeeker RecordID" column header
+        logger.info(f"{LOG} Step 1: Clicking 'JobSeeker RecordID' column header...")
+        header_clicked, _, _ = _find_and_click_snapshot(
+            'JobSeeker RecordID', exclude_text=None, max_retries=3, log_prefix=LOG
+        )
+        if not header_clicked:
+            # Try shorter text match
+            header_clicked, _, _ = _find_and_click_snapshot(
+                'RecordID', exclude_text='Create', max_retries=2, log_prefix=LOG
+            )
+        if not header_clicked:
+            logger.error(f"{LOG} Failed to find/click 'JobSeeker RecordID' column header")
+            _take_filter_screenshot("recordid_01_header_FAILED")
+            return {"success": False, "record_id": record_id, "error": "Column header not found"}
+
+        time.sleep(2)  # Wait for dropdown to render
+        _take_filter_screenshot("recordid_01_header_click")
+
+        # Step 2: Click "Edit column" from the dropdown
+        logger.info(f"{LOG} Step 2: Clicking 'Edit column' from dropdown...")
+        edit_clicked, _, _ = _find_and_click_snapshot(
+            'Edit column', max_retries=3, log_prefix=LOG
+        )
+        if not edit_clicked:
+            logger.error(f"{LOG} 'Edit column' not found in dropdown")
+            _take_filter_screenshot("recordid_02_edit_FAILED")
+            return {"success": False, "record_id": record_id, "error": "Edit column option not found"}
+
+        time.sleep(2)  # Wait for edit panel to open on right side
+        _take_filter_screenshot("recordid_02_edit_panel")
+
+        # Step 3: Find and fill the text input in the edit panel
+        # The edit panel has an input with placeholder "Type / to insert column"
+        logger.info(f"{LOG} Step 3: Finding text input in edit panel...")
+
+        # Take interactive snapshot to find input fields
+        snap = run_agent_browser_command(["snapshot", "-i"])
+        if not snap:
+            logger.error(f"{LOG} Failed to get snapshot for edit panel")
+            return {"success": False, "record_id": record_id, "error": "Snapshot failed"}
+
+        # Strategy 1: Find input with "Type /" placeholder text
+        input_ref = None
+        for line in snap.split('\n'):
+            line_lower = line.lower()
+            if ('type /' in line_lower or 'insert column' in line_lower) and ('textbox' in line_lower or 'input' in line_lower or 'combobox' in line_lower):
+                refs = _extract_refs(line)
+                if refs:
+                    input_ref = refs[0]
+                    logger.info(f"{LOG} Found input via placeholder text: {input_ref} in: {line.strip()[:120]}")
+                    break
+
+        # Strategy 2: Find any textbox/input near "Edit column" context
+        if not input_ref:
+            for line in snap.split('\n'):
+                line_lower = line.lower()
+                if 'textbox' in line_lower or 'combobox' in line_lower:
+                    # Skip if it's a search box or unrelated
+                    if 'search' in line_lower:
+                        continue
+                    refs = _extract_refs(line)
+                    if refs:
+                        input_ref = refs[0]
+                        logger.info(f"{LOG} Found input via textbox scan: {input_ref} in: {line.strip()[:120]}")
+                        break
+
+        # Strategy 3: Look for contenteditable or textarea elements
+        if not input_ref:
+            for line in snap.split('\n'):
+                line_lower = line.lower()
+                if 'textarea' in line_lower or 'contenteditable' in line_lower:
+                    refs = _extract_refs(line)
+                    if refs:
+                        input_ref = refs[0]
+                        logger.info(f"{LOG} Found input via textarea/contenteditable: {input_ref} in: {line.strip()[:120]}")
+                        break
+
+        if not input_ref:
+            logger.error(f"{LOG} Could not find text input in edit panel")
+            # Log snapshot for debugging
+            for i, line in enumerate(snap.split('\n')):
+                if any(kw in line.lower() for kw in ['input', 'textbox', 'text', 'type', 'edit', 'combobox']):
+                    logger.info(f"{LOG} Diag line {i}: {line.strip()[:120]}")
+            _take_filter_screenshot("recordid_03_input_FAILED")
+            return {"success": False, "record_id": record_id, "error": "Text input not found in edit panel"}
+
+        # Step 4: Fill the record ID
+        logger.info(f"{LOG} Step 4: Filling record ID '{record_id}' into {input_ref}...")
+
+        # Triple-click to select all existing text, then type new value
+        run_agent_browser_command(["click", input_ref])
+        time.sleep(0.5)
+        run_agent_browser_command(["press", "Control+a"])
+        time.sleep(0.3)
+
+        fill_result = run_agent_browser_command(["fill", input_ref, record_id])
+        logger.info(f"{LOG} Fill result: {fill_result}")
+
+        time.sleep(1)
+
+        # Press Enter to confirm the value
+        run_agent_browser_command(["press", "Enter"])
+        time.sleep(2)
+
+        _take_filter_screenshot("recordid_03_filled")
+
+        # Step 5: Close the edit panel by pressing Escape
+        run_agent_browser_command(["press", "Escape"])
+        time.sleep(1)
+        # Press Escape again to close any remaining panel
+        run_agent_browser_command(["press", "Escape"])
+        time.sleep(1)
+
+        _take_filter_screenshot("recordid_04_complete")
+        logger.info(f"{LOG} Successfully set JobSeeker RecordID to '{record_id}'")
+        return {"success": True, "record_id": record_id}
+
+    except Exception as e:
+        logger.error(f"{LOG} Exception during RecordID update: {e}")
+        _take_filter_screenshot("recordid_exception")
+        return {"success": False, "record_id": record_id, "error": str(e)}
+
+
 def trigger_enrichment(expected_count=None, import_result=None) -> Dict[str, Any]:
     """
     After import completes, clicks the 'Create Profile' play button to trigger
@@ -1373,84 +1630,6 @@ def trigger_enrichment(expected_count=None, import_result=None) -> Dict[str, Any
     logger.info(f"[ENRICHMENT] Starting enrichment trigger sequence... (import_rows={import_rows})")
 
     try:
-        import re as _re
-
-        def _find_and_click_snapshot(search_text, exclude_text=None, max_retries=3):
-            """
-            Use agent-browser snapshot to find element by text, then native click.
-            Native clicks properly trigger React event handlers (unlike JS DOM clicks).
-            Returns (success: bool, click_result: str, matched_line: str)
-            """
-            search_lower = search_text.lower()
-            exclude_lower = exclude_text.lower() if exclude_text else None
-
-            for attempt in range(max_retries):
-                snapshot_text = run_agent_browser_command(["snapshot"])
-                if not snapshot_text:
-                    time.sleep(2)
-                    continue
-
-                lines = snapshot_text.split('\n')
-
-                # Log snapshot diagnostics on first attempt
-                if attempt == 0:
-                    logger.info(f"[ENRICHMENT] Snapshot: {len(lines)} lines, {len(snapshot_text)} chars")
-                    # Log lines containing keywords for debugging
-                    for i, line in enumerate(lines):
-                        ll = line.lower()
-                        if 'profile' in ll or 'create' in ll or 'run' in ll:
-                            logger.info(f"[ENRICHMENT] Snapshot diag line {i}: {line.strip()[:120]}")
-
-                def _extract_refs(line_text):
-                    """Extract element refs from snapshot line. Handles both @eXX and [ref=eXX] formats."""
-                    # Try [ref=eXX] format first (standard snapshot format)
-                    ref_matches = _re.findall(r'\[ref=(e\d+)\]', line_text)
-                    if ref_matches:
-                        return ['@' + r for r in ref_matches]  # Prepend @ for click command
-                    # Fallback: try @eXX format
-                    at_matches = _re.findall(r'(@e\d+)', line_text)
-                    return at_matches
-
-                # Search with case-insensitive matching
-                for i, line in enumerate(lines):
-                    line_lower = line.lower()
-                    if search_lower in line_lower:
-                        if exclude_lower and exclude_lower in line_lower:
-                            continue
-                        refs = _extract_refs(line)
-                        if refs:
-                            logger.info(f"[ENRICHMENT] Found '{search_text}' at line {i}: {line.strip()[:120]}, refs={refs}")
-                            for ref in refs:
-                                click_result = run_agent_browser_command(["click", ref])
-                                logger.info(f"[ENRICHMENT] Native click {ref}: {click_result}")
-                                if click_result and "error" not in str(click_result).lower():
-                                    return True, click_result, line.strip()
-                                time.sleep(1)
-
-                # Also try matching individual words (handles "Create" + "Profile" on separate elements)
-                if ' ' in search_text:
-                    words = search_text.split()
-                    for i, line in enumerate(lines):
-                        line_lower = line.lower()
-                        if all(w.lower() in line_lower for w in words):
-                            if exclude_lower and exclude_lower in line_lower:
-                                continue
-                            refs = _extract_refs(line)
-                            if refs:
-                                logger.info(f"[ENRICHMENT] Found '{search_text}' (word match) at line {i}: {line.strip()[:120]}, refs={refs}")
-                                for ref in refs:
-                                    click_result = run_agent_browser_command(["click", ref])
-                                    logger.info(f"[ENRICHMENT] Native click {ref}: {click_result}")
-                                    if click_result and "error" not in str(click_result).lower():
-                                        return True, click_result, line.strip()
-                                    time.sleep(1)
-
-                if attempt < max_retries - 1:
-                    logger.info(f"[ENRICHMENT] '{search_text}' not found in snapshot, retrying ({attempt + 1}/{max_retries})...")
-                    time.sleep(3)
-
-            return False, None, None
-
         # ================================================================
         # Step 1: Click "Create Profile" column header to open dropdown
         # Using agent-browser native click (Playwright) for proper React event handling
@@ -1670,7 +1849,8 @@ def run_automation_for_jobseeker(jobseeker: Dict[str, Any]):
     # This eliminates the need for GPT-4o in the happy path.
     # Clay disables the button with a loading spinner while computing results.
     logger.info("[IMPORT] Attempting deterministic 'Add to table' click...")
-    deterministic_result = click_add_to_table_deterministic()
+    record_id = jobseeker.get("id", "unknown")
+    deterministic_result = click_add_to_table_deterministic(record_id=record_id)
     if deterministic_result:
         logger.info(f"[IMPORT] Deterministic import succeeded: {json.dumps(deterministic_result)}")
         debug_state.complete_run(deterministic_result)

@@ -1671,38 +1671,57 @@ def update_record_id_column(record_id: str) -> Dict[str, Any]:
                 _take_filter_screenshot("recordid_03_input_FAILED")
                 return {"success": False, "record_id": record_id, "error": "Text input not found in edit panel (all 6 strategies failed)"}
 
-        # Step 4: Fill the record ID via Playwright (skip if JS fallback already filled)
+        # Step 4: Replace text in the contenteditable editor
+        # Clay uses a rich text editor (contenteditable div), NOT a native <input>.
+        # Playwright's `fill` command silently fails on contenteditable elements.
+        # Must use JavaScript execCommand instead.
         if not used_js_fallback:
-            logger.info(f"{LOG} Step 4: Filling record ID '{record_id}' into {input_ref}...")
+            logger.info(f"{LOG} Step 4: Replacing text with '{record_id}' in {input_ref}...")
 
-            # Click the input to focus it
+            # Click the input ref to focus the contenteditable element
             run_agent_browser_command(["click", input_ref])
             time.sleep(0.5)
 
-            # Select all existing text
-            run_agent_browser_command(["press", "Control+a"])
-            time.sleep(0.3)
+            # Use JavaScript to select all text and replace with record_id
+            # execCommand('insertText') is the correct API for contenteditable
+            js_replace = f"""(() => {{
+                const el = document.activeElement;
+                if (el && (el.isContentEditable || el.tagName === 'TEXTAREA' || el.tagName === 'INPUT')) {{
+                    if (el.isContentEditable) {{
+                        document.execCommand('selectAll', false, null);
+                        document.execCommand('insertText', false, '{record_id}');
+                    }} else {{
+                        el.select();
+                        el.value = '{record_id}';
+                        el.dispatchEvent(new Event('input', {{bubbles: true}}));
+                    }}
+                    return JSON.stringify({{success: true, tag: el.tagName, editable: el.isContentEditable}});
+                }}
+                return JSON.stringify({{success: false, tag: document.activeElement?.tagName}});
+            }})()"""
+            js_result = run_agent_browser_command(["eval", js_replace])
+            logger.info(f"{LOG} JS replace result: {js_result}")
 
-            # Fill with record_id
-            fill_result = run_agent_browser_command(["fill", input_ref, record_id])
-            logger.info(f"{LOG} Fill result: {fill_result}")
+            time.sleep(1)
 
-            # If fill fails, try typing instead
-            if fill_result and "error" in str(fill_result).lower():
-                logger.info(f"{LOG} Fill failed, trying type approach...")
+            # Verify: take snapshot and check new value appears
+            verify_snap = run_agent_browser_command(["snapshot"]) or ""
+            if record_id[:8] in verify_snap:
+                logger.info(f"{LOG} Verified: '{record_id[:8]}...' found in snapshot after fill")
+            else:
+                logger.warning(f"{LOG} Could not verify record_id in snapshot — trying keyboard fallback")
+                # Last resort: Ctrl+A and type character by character
                 run_agent_browser_command(["click", input_ref])
                 time.sleep(0.3)
                 run_agent_browser_command(["press", "Control+a"])
                 time.sleep(0.2)
                 run_agent_browser_command(["press", "Backspace"])
                 time.sleep(0.2)
-                # Type character by character via keyboard
                 for char in record_id:
                     run_agent_browser_command(["press", char])
                     time.sleep(0.05)
-                logger.info(f"{LOG} Typed record_id via keyboard")
+                logger.info(f"{LOG} Typed record_id via keyboard as last resort")
 
-            time.sleep(1)
             _take_filter_screenshot("recordid_03_filled")
 
         # Step 5: Click "Save and don't run enrichments" button to apply value

@@ -1522,87 +1522,205 @@ def update_record_id_column(record_id: str) -> Dict[str, Any]:
         _take_filter_screenshot("recordid_02_edit_panel")
 
         # Step 3: Find and fill the text input in the edit panel
-        # The edit panel has an input with placeholder "Type / to insert column"
+        # Clay's edit panel has a rich text editor for the column value
+        # It may appear as textbox, editor, textarea, or contenteditable
         logger.info(f"{LOG} Step 3: Finding text input in edit panel...")
 
-        # Take interactive snapshot to find input fields
-        snap = run_agent_browser_command(["snapshot", "-i"])
-        if not snap:
-            logger.error(f"{LOG} Failed to get snapshot for edit panel")
-            return {"success": False, "record_id": record_id, "error": "Snapshot failed"}
+        # Try both snapshot modes - interactive and regular may show elements differently
+        snap_i = run_agent_browser_command(["snapshot", "-i"]) or ""
+        snap_r = run_agent_browser_command(["snapshot"]) or ""
 
-        # Strategy 1: Find input with "Type /" placeholder text
+        # Log full interactive snapshot for debugging
+        logger.info(f"{LOG} Edit panel snapshot-i ({len(snap_i)} chars):")
+        for i, line in enumerate(snap_i.split('\n')):
+            if line.strip():
+                logger.info(f"{LOG} SNAP[{i}]: {line.rstrip()[:160]}")
+
         input_ref = None
-        for line in snap.split('\n'):
-            line_lower = line.lower()
-            if ('type /' in line_lower or 'insert column' in line_lower) and ('textbox' in line_lower or 'input' in line_lower or 'combobox' in line_lower):
-                refs = _extract_refs(line)
-                if refs:
-                    input_ref = refs[0]
-                    logger.info(f"{LOG} Found input via placeholder text: {input_ref} in: {line.strip()[:120]}")
-                    break
+        used_js_fallback = False
+        role_keywords = ['textbox', 'input', 'combobox', 'editor']
+        skip_keywords = ['search', 'data type', 'column name', 'rename']
 
-        # Strategy 2: Find any textbox/input near "Edit column" context
-        if not input_ref:
-            for line in snap.split('\n'):
-                line_lower = line.lower()
-                if 'textbox' in line_lower or 'combobox' in line_lower:
-                    # Skip if it's a search box or unrelated
-                    if 'search' in line_lower:
+        # Search a snapshot string with multiple strategies
+        for snap_label, snap in [("snap-i", snap_i), ("snap-reg", snap_r)]:
+            if input_ref:
+                break
+            lines = snap.split('\n')
+
+            # Strategy 1: placeholder text + input role on same line
+            for line in lines:
+                ll = line.lower()
+                if ('type /' in ll or 'insert column' in ll):
+                    if any(kw in ll for kw in role_keywords):
+                        refs = _extract_refs(line)
+                        if refs:
+                            input_ref = refs[0]
+                            logger.info(f"{LOG} {snap_label} S1 placeholder+role: {input_ref} | {line.strip()[:120]}")
+                            break
+            if input_ref:
+                break
+
+            # Strategy 2: any textbox/combobox/editor (skip irrelevant)
+            for line in lines:
+                ll = line.lower()
+                if any(kw in ll for kw in role_keywords):
+                    if any(skip in ll for skip in skip_keywords):
                         continue
                     refs = _extract_refs(line)
                     if refs:
                         input_ref = refs[0]
-                        logger.info(f"{LOG} Found input via textbox scan: {input_ref} in: {line.strip()[:120]}")
+                        logger.info(f"{LOG} {snap_label} S2 role-scan: {input_ref} | {line.strip()[:120]}")
                         break
+            if input_ref:
+                break
 
-        # Strategy 3: Look for contenteditable or textarea elements
-        if not input_ref:
-            for line in snap.split('\n'):
-                line_lower = line.lower()
-                if 'textarea' in line_lower or 'contenteditable' in line_lower:
+            # Strategy 3: textarea / contenteditable
+            for line in lines:
+                ll = line.lower()
+                if 'textarea' in ll or 'contenteditable' in ll:
                     refs = _extract_refs(line)
                     if refs:
                         input_ref = refs[0]
-                        logger.info(f"{LOG} Found input via textarea/contenteditable: {input_ref} in: {line.strip()[:120]}")
+                        logger.info(f"{LOG} {snap_label} S3 textarea: {input_ref} | {line.strip()[:120]}")
+                        break
+            if input_ref:
+                break
+
+            # Strategy 4: proximity - find "Type /" line, look at preceding lines for refs
+            type_line_idx = None
+            for i, line in enumerate(lines):
+                if 'type /' in line.lower() or 'insert column' in line.lower():
+                    type_line_idx = i
+                    break
+            if type_line_idx is not None:
+                # Search 15 lines before "Type /" for the nearest ref
+                for j in range(type_line_idx - 1, max(-1, type_line_idx - 16), -1):
+                    refs = _extract_refs(lines[j])
+                    if refs:
+                        input_ref = refs[-1]  # Last ref on line = deepest element
+                        logger.info(f"{LOG} {snap_label} S4 proximity: {input_ref} at line {j}: {lines[j].strip()[:120]}")
+                        break
+            if input_ref:
+                break
+
+            # Strategy 5: line containing existing record ID value (starts with 'rec')
+            for line in lines:
+                ll = line.lower()
+                if re.search(r'\brec[a-z0-9]{8,}', ll):
+                    refs = _extract_refs(line)
+                    if refs:
+                        input_ref = refs[0]
+                        logger.info(f"{LOG} {snap_label} S5 existing-recID: {input_ref} | {line.strip()[:120]}")
                         break
 
+        # Strategy 6 (JavaScript fallback): directly find and fill via DOM
         if not input_ref:
-            logger.error(f"{LOG} Could not find text input in edit panel")
-            # Log snapshot for debugging
-            for i, line in enumerate(snap.split('\n')):
-                if any(kw in line.lower() for kw in ['input', 'textbox', 'text', 'type', 'edit', 'combobox']):
-                    logger.info(f"{LOG} Diag line {i}: {line.strip()[:120]}")
-            _take_filter_screenshot("recordid_03_input_FAILED")
-            return {"success": False, "record_id": record_id, "error": "Text input not found in edit panel"}
+            logger.info(f"{LOG} All snapshot strategies failed. Trying JavaScript fallback...")
+            js_fill = f"""(() => {{
+                // Try contenteditable elements (Clay rich text editor)
+                const editables = document.querySelectorAll('[contenteditable="true"]');
+                for (const el of editables) {{
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width > 100 && rect.height > 15 && rect.right > window.innerWidth / 2) {{
+                        el.focus();
+                        document.execCommand('selectAll', false, null);
+                        document.execCommand('insertText', false, '{record_id}');
+                        return JSON.stringify({{found: true, method: 'contenteditable', tag: el.tagName}});
+                    }}
+                }}
+                // Try textareas
+                const textareas = document.querySelectorAll('textarea');
+                for (const el of textareas) {{
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width > 100 && rect.right > window.innerWidth / 2) {{
+                        el.focus();
+                        el.value = '{record_id}';
+                        el.dispatchEvent(new Event('input', {{bubbles: true}}));
+                        el.dispatchEvent(new Event('change', {{bubbles: true}}));
+                        return JSON.stringify({{found: true, method: 'textarea', tag: el.tagName}});
+                    }}
+                }}
+                // Try inputs with placeholder containing "Type"
+                const inputs = document.querySelectorAll('input[type="text"], input:not([type])');
+                for (const el of inputs) {{
+                    if (el.placeholder && el.placeholder.includes('Type')) {{
+                        el.focus();
+                        el.value = '{record_id}';
+                        el.dispatchEvent(new Event('input', {{bubbles: true}}));
+                        el.dispatchEvent(new Event('change', {{bubbles: true}}));
+                        return JSON.stringify({{found: true, method: 'input', tag: el.tagName}});
+                    }}
+                }}
+                return JSON.stringify({{found: false}});
+            }})()"""
+            js_result = run_agent_browser_command(["eval", js_fill])
+            logger.info(f"{LOG} JS fallback result: {js_result}")
 
-        # Step 4: Fill the record ID
-        logger.info(f"{LOG} Step 4: Filling record ID '{record_id}' into {input_ref}...")
+            if js_result and '"found": true' in js_result.replace('"found":true', '"found": true'):
+                used_js_fallback = True
+                time.sleep(1)
+                _take_filter_screenshot("recordid_03_filled_js")
+            else:
+                logger.error(f"{LOG} All strategies (including JS) failed to find input")
+                _take_filter_screenshot("recordid_03_input_FAILED")
+                return {"success": False, "record_id": record_id, "error": "Text input not found in edit panel (all 6 strategies failed)"}
 
-        # Triple-click to select all existing text, then type new value
-        run_agent_browser_command(["click", input_ref])
-        time.sleep(0.5)
-        run_agent_browser_command(["press", "Control+a"])
-        time.sleep(0.3)
+        # Step 4: Fill the record ID via Playwright (skip if JS fallback already filled)
+        if not used_js_fallback:
+            logger.info(f"{LOG} Step 4: Filling record ID '{record_id}' into {input_ref}...")
 
-        fill_result = run_agent_browser_command(["fill", input_ref, record_id])
-        logger.info(f"{LOG} Fill result: {fill_result}")
+            # Click the input to focus it
+            run_agent_browser_command(["click", input_ref])
+            time.sleep(0.5)
 
+            # Select all existing text
+            run_agent_browser_command(["press", "Control+a"])
+            time.sleep(0.3)
+
+            # Fill with record_id
+            fill_result = run_agent_browser_command(["fill", input_ref, record_id])
+            logger.info(f"{LOG} Fill result: {fill_result}")
+
+            # If fill fails, try typing instead
+            if fill_result and "error" in str(fill_result).lower():
+                logger.info(f"{LOG} Fill failed, trying type approach...")
+                run_agent_browser_command(["click", input_ref])
+                time.sleep(0.3)
+                run_agent_browser_command(["press", "Control+a"])
+                time.sleep(0.2)
+                run_agent_browser_command(["press", "Backspace"])
+                time.sleep(0.2)
+                # Type character by character via keyboard
+                for char in record_id:
+                    run_agent_browser_command(["press", char])
+                    time.sleep(0.05)
+                logger.info(f"{LOG} Typed record_id via keyboard")
+
+            time.sleep(1)
+            _take_filter_screenshot("recordid_03_filled")
+
+        # Step 5: Click "Save and don't run enrichments" button to apply value
+        # (Pressing Escape might not save the value)
+        logger.info(f"{LOG} Step 5: Clicking 'Save and don't run enrichments'...")
         time.sleep(1)
 
-        # Press Enter to confirm the value
-        run_agent_browser_command(["press", "Enter"])
+        save_clicked, _, _ = _find_and_click_snapshot(
+            "Save and don't run", max_retries=2, log_prefix=LOG
+        )
+        if not save_clicked:
+            # Fall back to just "Save" button
+            save_clicked, _, _ = _find_and_click_snapshot(
+                'Save', exclude_text='don', max_retries=2, log_prefix=LOG
+            )
+        if not save_clicked:
+            # Last resort: press Escape and hope the value was auto-saved
+            logger.warning(f"{LOG} Could not find Save button, pressing Escape as fallback")
+            run_agent_browser_command(["press", "Escape"])
+            time.sleep(1)
+            run_agent_browser_command(["press", "Escape"])
+            time.sleep(1)
+
         time.sleep(2)
-
-        _take_filter_screenshot("recordid_03_filled")
-
-        # Step 5: Close the edit panel by pressing Escape
-        run_agent_browser_command(["press", "Escape"])
-        time.sleep(1)
-        # Press Escape again to close any remaining panel
-        run_agent_browser_command(["press", "Escape"])
-        time.sleep(1)
-
         _take_filter_screenshot("recordid_04_complete")
         logger.info(f"{LOG} Successfully set JobSeeker RecordID to '{record_id}'")
         return {"success": True, "record_id": record_id}

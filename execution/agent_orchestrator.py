@@ -481,8 +481,8 @@ Return ONLY valid JSON (no markdown, no explanation):
         logger.error(f"Error interpreting criteria: {e}")
         raise
 
-# Default import limit for Clay People Search
-IMPORT_LIMIT = 150
+# Import limit for Clay People Search (configurable via environment variable)
+IMPORT_LIMIT = int(os.getenv("IMPORT_LIMIT", "100"))
 
 def set_import_limit(limit: int = IMPORT_LIMIT) -> bool:
     """
@@ -942,13 +942,17 @@ def apply_filters_deterministic(search_criteria):
 
 def wait_for_add_button_enabled(max_wait=90, poll_interval=5):
     """
-    Poll snapshots until the 'Add to table' button is enabled (not loading).
+    Poll snapshots until the 'Add to table' OR 'Continue' button is enabled (not loading).
+    Clay shows different buttons depending on table state:
+    - Empty table: Shows "Continue" button
+    - Table with existing records: Shows "Add to table" button
+
     Clay disables the button with a loading spinner while computing search results
     after filter changes. Must wait for loading to complete before clicking.
 
-    Returns: (button_ref, snapshot) if found enabled, (None, snapshot) if timeout.
+    Returns: (button_ref, button_text, snapshot) if found enabled, (None, None, snapshot) if timeout.
     """
-    logger.info("[IMPORT] Waiting for 'Add to table' button to become enabled...")
+    logger.info("[IMPORT] Waiting for 'Add to table' or 'Continue' button to become enabled...")
 
     # Scroll up to ensure the button area is visible (filters may have scrolled down)
     run_agent_browser_command(["scroll", "up"])
@@ -961,45 +965,64 @@ def wait_for_add_button_enabled(max_wait=90, poll_interval=5):
         snap = run_agent_browser_command(["snapshot", "-i"])
         last_snap = snap
 
-        # Look for "Add to table" button ref
+        # Look for "Add to table" button ref (existing table with records)
         button_ref = None
+        button_text = None
         is_disabled = False
+
         for line in snap.split('\n'):
             if 'add to table' in line.lower() and '[ref=' in line:
                 parts = line.split('[ref=')
                 if len(parts) > 1:
                     button_ref = parts[1].split(']')[0]
-                    # Check if button has [disabled] marker
+                    button_text = "Add to table"
                     is_disabled = '[disabled]' in line.lower()
                     break
 
+        # If "Add to table" not found, look for "Continue" button (empty table)
+        if not button_ref:
+            for line in snap.split('\n'):
+                line_lower = line.lower()
+                if 'continue' in line_lower and '[ref=' in line and 'button' in line_lower:
+                    # Make sure it's not "Continue in browser" or similar
+                    if 'browser' not in line_lower and 'app' not in line_lower:
+                        parts = line.split('[ref=')
+                        if len(parts) > 1:
+                            button_ref = parts[1].split(']')[0]
+                            button_text = "Continue"
+                            is_disabled = '[disabled]' in line_lower
+                            break
+
         if button_ref and not is_disabled:
-            logger.info(f"[IMPORT] 'Add to table' button is enabled: @{button_ref} (waited {elapsed}s)")
-            return button_ref, snap
+            logger.info(f"[IMPORT] '{button_text}' button is enabled: @{button_ref} (waited {elapsed}s)")
+            return button_ref, button_text, snap
         elif button_ref:
-            logger.info(f"[IMPORT] Button found but disabled (loading), waiting... ({elapsed}s/{max_wait}s)")
+            logger.info(f"[IMPORT] '{button_text}' button found but disabled (loading), waiting... ({elapsed}s/{max_wait}s)")
         else:
-            logger.info(f"[IMPORT] Button not found in snapshot, scrolling up... ({elapsed}s/{max_wait}s)")
+            logger.info(f"[IMPORT] No import button found in snapshot, scrolling up... ({elapsed}s/{max_wait}s)")
             run_agent_browser_command(["scroll", "up"])
 
         time.sleep(poll_interval)
         elapsed += poll_interval
 
     logger.warning(f"[IMPORT] Timeout waiting for button after {max_wait}s")
-    return None, last_snap
+    return None, None, last_snap
 
 
 def click_add_to_table_deterministic(record_id=None):
     """
-    Deterministically wait for and click the 'Add to table' button.
-    Handles: loading state wait, confirmation dialogs, page transition verification.
+    Deterministically wait for and click the import button.
+    Handles two scenarios:
+    - Empty table: Click "Continue" → Click "Add as new rows"
+    - Table with existing records: Click "Add to table"
+    Also handles: loading state wait, confirmation dialogs, page transition verification.
 
     Returns: dict with import/enrichment results, or None if button not found (fall back to GPT-4o).
     """
-    logger.info("[IMPORT] Starting deterministic 'Add to table' flow...")
+    logger.info("[IMPORT] Starting deterministic import flow...")
 
     # Step 1: Wait for button to become enabled (Clay loads results after filter changes)
-    button_ref, snap = wait_for_add_button_enabled(max_wait=90, poll_interval=5)
+    button_ref, button_text, snap = wait_for_add_button_enabled(max_wait=90, poll_interval=5)
 
     if not button_ref:
         logger.warning("[IMPORT] Button never became enabled — falling back to GPT-4o")
@@ -1019,14 +1042,15 @@ def click_add_to_table_deterministic(record_id=None):
 
     # Step 4: Click the button
     res = run_agent_browser_command(["click", f"@{button_ref}"])
-    logger.info(f"[IMPORT] Click 'Add to table' result: {res}")
+    logger.info(f"[IMPORT] Click '{button_text}' result: {res}")
 
     if res and "Error" in res:
         # Button ref may have shifted — re-snapshot and try once more
         logger.warning(f"[IMPORT] Click failed: {res}. Re-snapshotting...")
         snap = run_agent_browser_command(["snapshot", "-i"])
+        search_text = button_text.lower()
         for line in snap.split('\n'):
-            if 'add to table' in line.lower() and '[ref=' in line and '[disabled]' not in line.lower():
+            if search_text in line.lower() and '[ref=' in line and '[disabled]' not in line.lower():
                 parts = line.split('[ref=')
                 if len(parts) > 1:
                     button_ref = parts[1].split(']')[0]
@@ -1034,6 +1058,39 @@ def click_add_to_table_deterministic(record_id=None):
                     logger.info(f"[IMPORT] Retry click result: {res}")
                     break
     time.sleep(3)
+
+    # Step 4b: If "Continue" button was clicked, now click "Add as new rows" from dropdown
+    if button_text == "Continue":
+        logger.info("[IMPORT] 'Continue' clicked, now looking for 'Add as new rows' option...")
+        time.sleep(2)  # Wait for dropdown to appear
+        snap = run_agent_browser_command(["snapshot", "-i"])
+
+        add_rows_ref = None
+        for line in snap.split('\n'):
+            if 'add as new rows' in line.lower() and '[ref=' in line:
+                parts = line.split('[ref=')
+                if len(parts) > 1:
+                    add_rows_ref = parts[1].split(']')[0]
+                    break
+
+        if add_rows_ref:
+            logger.info(f"[IMPORT] Found 'Add as new rows' option: @{add_rows_ref}")
+            res = run_agent_browser_command(["click", f"@{add_rows_ref}"])
+            logger.info(f"[IMPORT] Click 'Add as new rows' result: {res}")
+            time.sleep(3)
+        else:
+            logger.warning("[IMPORT] 'Add as new rows' option not found in dropdown")
+            # Try to find it by looking for any text with "new rows"
+            for line in snap.split('\n'):
+                if 'new rows' in line.lower() and '[ref=' in line:
+                    parts = line.split('[ref=')
+                    if len(parts) > 1:
+                        add_rows_ref = parts[1].split(']')[0]
+                        logger.info(f"[IMPORT] Found alternative match with 'new rows': @{add_rows_ref}")
+                        res = run_agent_browser_command(["click", f"@{add_rows_ref}"])
+                        logger.info(f"[IMPORT] Click result: {res}")
+                        time.sleep(3)
+                        break
 
     # Step 5: Handle confirmation dialog (if any)
     snap = run_agent_browser_command(["snapshot", "-i"])

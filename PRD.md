@@ -26,7 +26,7 @@ When implementing this PRD, the agent **must** review and align with these refer
 
 Build a **cloud-hosted AI agent** that:
 
-1. Reads **job seeker** records from Airtable where status = `profile sourcing`.
+1. Reads **job seeker** records from Airtable where status = `✨ Sourcing Profiles`.
 2. Uses **OpenAI GPT-4o** to generate a structured "search profile" from each job seeker's data.
 3. Uses **Vercel Agent Browser CLI** (Cole-style Skill approach) to drive Clay's web UI like a human.
 4. Uses Clay's pre-configured table "send" destinations to deliver profiles to downstream systems.
@@ -46,10 +46,10 @@ Build a **cloud-hosted AI agent** that:
 
 **Main Scenario:**
 
-1. Recruiter adds or updates a job seeker in Airtable and sets status to `profile sourcing`.
-2. The application wakes up (or is invoked) and processes all job seekers in `profile sourcing` status.
+1. Recruiter adds or updates a job seeker in Airtable and sets status to `✨ Sourcing Profiles`.
+2. The application poll on the airtable base at a regular interval and processes all job seekers in `✨ Sourcing Profiles` status.
 3. For each job seeker, the application drives the Clay table to find and send similar profiles.
-4. When done, the job seeker record is updated in Airtable with a new status and basic results.
+4. When done, the job seeker record status is updated in Airtable with a new status of `✅ Ready to Launch`
 
 ---
 
@@ -124,7 +124,7 @@ Core workflow:
 
 | ID | Requirement |
 |----|-------------|
-| FR-1 | Query Airtable for records where `status` = `profile sourcing`. |
+| FR-1 | Query Airtable for records where `status` = `✨ Sourcing Profiles`. |
 | FR-2 | Read at least: Record ID, Name, Role/Title, Skills/keywords, Location preference, Notes/description. |
 | FR-3 | Field names must be configurable via environment variables or config file. |
 
@@ -189,7 +189,7 @@ agent-browser click @e35           # Delete button
 
 | ID | Requirement |
 |----|-------------|
-| FR-11 | After Clay step finishes, update job seeker record with: new status (`sourced`, `no_matches_found`, or `error`), number of profiles sent, timestamp. |
+| FR-11 | After Clay step finishes, update job seeker record with: new status (`✅ Ready to Launch`, `no_matches_found`, or `❌ Error`), number of profiles sent, timestamp. |
 | FR-12 | On error, write error status and short description into Airtable. |
 
 ### 4.5 Execution Control

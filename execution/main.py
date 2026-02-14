@@ -18,6 +18,20 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
+# Initialize scheduler when running under Gunicorn or standalone
+# This runs once per worker, but max_instances=1 prevents concurrent job execution
+if os.environ.get("ENABLE_SCHEDULER", "true").lower() == "true":
+    import scheduler
+    from threading import Timer
+
+    def delayed_scheduler_start():
+        """Start scheduler after a delay to allow Flask to fully initialize."""
+        scheduler.start_scheduler()
+
+    # Start scheduler 5 seconds after worker starts
+    Timer(5.0, delayed_scheduler_start).start()
+    logger.info("Scheduler will start in 5 seconds...")
+
 @app.route("/test-connectivity", methods=["GET"])
 def connectivity_test():
     """Verify if the browser can reach a simple external site."""
@@ -38,7 +52,22 @@ def clay_auth_test():
 
 @app.route("/", methods=["GET"])
 def health_check():
-    return jsonify({"status": "ok", "service": "clay-browser-automation"}), 200
+    """Health check endpoint with scheduler status."""
+    response = {
+        "status": "ok",
+        "service": "clay-browser-automation",
+        "timestamp": datetime.now().isoformat()
+    }
+
+    # Include scheduler status if enabled
+    if os.environ.get("ENABLE_SCHEDULER", "true").lower() == "true":
+        try:
+            import scheduler
+            response["scheduler"] = scheduler.get_scheduler_status()
+        except Exception as e:
+            response["scheduler"] = {"error": str(e)}
+
+    return jsonify(response), 200
 
 @app.route("/run-automation", methods=["POST"])
 def trigger_automation():
@@ -123,6 +152,18 @@ def trigger_automation():
 def debug_status():
     """Current run status, turn number, last action, last error."""
     return jsonify(debug_state.get_status()), 200
+
+@app.route("/debug/scheduler", methods=["GET"])
+def debug_scheduler_status():
+    """Return scheduler status and next run times."""
+    if os.environ.get("ENABLE_SCHEDULER", "true").lower() != "true":
+        return jsonify({"error": "Scheduler is disabled", "enabled": False}), 200
+
+    try:
+        import scheduler
+        return jsonify(scheduler.get_scheduler_status()), 200
+    except Exception as e:
+        return jsonify({"error": str(e), "enabled": True}), 500
 
 @app.route("/debug/screenshot", methods=["GET"])
 def debug_screenshot_latest():

@@ -1902,12 +1902,12 @@ def trigger_enrichment(expected_count=None, import_result=None) -> Dict[str, Any
         count = 0
         if run_all_clicked and run_all_line:
             # Try multiple patterns to extract the row count
-            count_match = _re.search(r'Run all ([\d,]+)', run_all_line)
+            count_match = re.search(r'Run all ([\d,]+)', run_all_line)
             if count_match:
                 count = int(count_match.group(1).replace(',', ''))
             else:
                 # Try "X rows" pattern anywhere in the line
-                rows_match = _re.search(r'([\d,]+)\s+rows?', run_all_line)
+                rows_match = re.search(r'([\d,]+)\s+rows?', run_all_line)
                 if rows_match:
                     count = int(rows_match.group(1).replace(',', ''))
 
@@ -1939,7 +1939,7 @@ def trigger_enrichment(expected_count=None, import_result=None) -> Dict[str, Any
             "rows that haven", max_retries=2
         )
         if alt_clicked and alt_line:
-            count_match = _re.search(r'([\d,]+)\s+rows?', alt_line)
+            count_match = re.search(r'([\d,]+)\s+rows?', alt_line)
             count = int(count_match.group(1).replace(',', '')) if count_match else 0
             # Fallback to import_rows or expected_count
             if count == 0 and import_rows > 0:

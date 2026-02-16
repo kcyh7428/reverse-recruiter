@@ -165,6 +165,45 @@ def debug_scheduler_status():
     except Exception as e:
         return jsonify({"error": str(e), "enabled": True}), 500
 
+@app.route("/debug/scheduler-logs", methods=["GET"])
+def debug_scheduler_logs():
+    """
+    Return persistent scheduler poll logs.
+    Query params:
+      - limit: max entries to return (default: 50)
+      - status: filter by status (success, failure, skipped, started)
+    """
+    try:
+        import scheduler_logger
+
+        # Get query parameters
+        limit = request.args.get("limit", default=50, type=int)
+        status_filter = request.args.get("status", default=None, type=str)
+
+        # Validate limit
+        if limit < 1:
+            limit = 50
+        elif limit > 500:
+            limit = 500
+
+        # Get logs
+        logs = scheduler_logger.get_recent_logs(limit=limit, status_filter=status_filter)
+        stats = scheduler_logger.get_log_stats()
+
+        return jsonify({
+            "logs": logs,
+            "total": len(logs),
+            "stats": stats,
+            "filter": {
+                "limit": limit,
+                "status": status_filter
+            }
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error retrieving scheduler logs: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/debug/screenshot", methods=["GET"])
 def debug_screenshot_latest():
     """Serve the latest screenshot (most recent turn)."""

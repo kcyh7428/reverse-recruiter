@@ -5,6 +5,8 @@ from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_EXECUTED
 import os
 import requests
 import atexit
+import time
+import scheduler_logger
 
 logger = logging.getLogger(__name__)
 
@@ -15,28 +17,66 @@ def scheduled_poll_job():
     """
     Job function that triggers batch automation via internal HTTP call.
     This avoids import cycles and reuses existing concurrency control.
+    Logs all poll activity to persistent JSON Lines log file.
     """
+    # Generate unique poll ID
+    poll_id = f"poll_{int(time.time())}"
+
+    # Log poll start
+    scheduler_logger.log_poll_start(poll_id)
+
     try:
         # Call the /run-automation endpoint internally
         # Use 127.0.0.1 to avoid DNS overhead
         port = os.environ.get("PORT", 8080)
         url = f"http://127.0.0.1:{port}/run-automation"
 
-        logger.info("[SCHEDULER] Triggering batch automation poll...")
-        response = requests.post(url, timeout=10)
+        logger.info(f"[SCHEDULER] {poll_id} - Triggering batch automation poll...")
+
+        # Increase timeout to 600 seconds (10 minutes) for long-running automation
+        response = requests.post(url, timeout=600)
 
         if response.status_code == 200:
             data = response.json()
-            logger.info(f"[SCHEDULER] Poll successful: {data}")
+            logger.info(f"[SCHEDULER] {poll_id} - Poll successful: {data}")
+
+            # Log success with results
+            scheduler_logger.log_poll_complete(poll_id, {
+                'records_found': data.get('processed', 0),
+                'records_processed': data.get('details', [])
+            })
+
         elif response.status_code == 409:
-            logger.info("[SCHEDULER] Automation already running (409), skipping this poll")
+            logger.info(f"[SCHEDULER] {poll_id} - Automation already running (409), skipping this poll")
+
+            # Log as skipped (not an error)
+            scheduler_logger.log_poll_complete(poll_id, {
+                'records_found': 0,
+                'status': 'skipped',
+                'message': 'Automation already running (409)',
+                'records_processed': []
+            })
+
         else:
-            logger.warning(f"[SCHEDULER] Unexpected response: {response.status_code} - {response.text}")
+            error_msg = f"HTTP {response.status_code}: {response.text[:200]}"
+            logger.warning(f"[SCHEDULER] {poll_id} - Unexpected response: {error_msg}")
+
+            # Log as error
+            scheduler_logger.log_poll_error(poll_id, error_msg)
 
     except requests.exceptions.Timeout:
-        logger.warning("[SCHEDULER] Poll request timed out (automation may be running)")
+        error_msg = "Poll request timed out after 600 seconds (automation may be running)"
+        logger.warning(f"[SCHEDULER] {poll_id} - {error_msg}")
+
+        # Log timeout as error
+        scheduler_logger.log_poll_error(poll_id, error_msg)
+
     except Exception as e:
-        logger.error(f"[SCHEDULER] Poll job failed: {e}", exc_info=True)
+        error_msg = f"Poll job failed: {str(e)}"
+        logger.error(f"[SCHEDULER] {poll_id} - {error_msg}", exc_info=True)
+
+        # Log exception as error
+        scheduler_logger.log_poll_error(poll_id, error_msg)
 
 def job_listener(event):
     """Log scheduler events for debugging."""
